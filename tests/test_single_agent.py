@@ -1,6 +1,7 @@
 """Tests for agents/single_agent.py (Anthropic API is mocked throughout)."""
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -58,10 +59,14 @@ class TestStripThinking:
 
 class TestSingleAgentInit:
     def test_ollama_backend(self):
-        with patch("openai.OpenAI"):
-            agent = SingleAgent(backend="ollama")
+        agent = SingleAgent(backend="ollama")
         assert agent.backend == "ollama"
         assert "deepseek" in agent.model
+
+    def test_ollama_client_is_none(self):
+        """Ollama backend uses urllib directly; no client object needed."""
+        agent = SingleAgent(backend="ollama")
+        assert agent.client is None
 
     def test_anthropic_backend(self):
         with patch("anthropic.Anthropic"):
@@ -70,13 +75,24 @@ class TestSingleAgentInit:
         assert "claude" in agent.model
 
     def test_custom_model_overrides_default(self):
-        with patch("openai.OpenAI"):
-            agent = SingleAgent(backend="ollama", model="qwen2.5:32b")
+        agent = SingleAgent(backend="ollama", model="qwen2.5:32b")
         assert agent.model == "qwen2.5:32b"
 
     def test_invalid_backend_raises(self):
         with pytest.raises(ValueError, match="Unknown backend"):
             SingleAgent(backend="invalid")
+
+    def test_timeout_stored(self):
+        agent = SingleAgent(backend="ollama", timeout=42.0)
+        assert agent._timeout == 42.0
+
+    def test_debug_flag_stored(self):
+        agent = SingleAgent(backend="ollama", debug=True)
+        assert agent.debug is True
+
+    def test_debug_defaults_false(self):
+        agent = SingleAgent(backend="ollama")
+        assert agent.debug is False
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +201,52 @@ class TestExtractCode:
         text = "```python\n\ndef transform(grid):\n    return grid\n\n```"
         code = agent._extract_code(text)
         assert not code.startswith("\n")
+
+
+# ---------------------------------------------------------------------------
+# _call_ollama — native Ollama API (urllib mocked)
+# ---------------------------------------------------------------------------
+
+def _ollama_ctx(content: str = "", thinking: str = "") -> MagicMock:
+    """Return a context-manager mock for urllib.request.urlopen."""
+    body = json.dumps(
+        {"message": {"role": "assistant", "content": content, "thinking": thinking}}
+    ).encode()
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=cm)
+    cm.__exit__ = MagicMock(return_value=False)
+    cm.read = MagicMock(return_value=body)
+    return cm
+
+
+class TestCallOllama:
+    def _agent(self) -> SingleAgent:
+        return SingleAgent(backend="ollama", timeout=10.0)
+
+    def test_content_returned_directly(self):
+        agent = self._agent()
+        with patch("urllib.request.urlopen", return_value=_ollama_ctx(content="Hello")):
+            result = agent._call_ollama([{"role": "user", "content": "hi"}])
+        assert result == "Hello"
+
+    def test_thinking_only_wrapped_in_tags(self):
+        agent = self._agent()
+        with patch("urllib.request.urlopen", return_value=_ollama_ctx(thinking="I reasoned")):
+            result = agent._call_ollama([{"role": "user", "content": "hi"}])
+        assert result == "<think>I reasoned</think>"
+
+    def test_thinking_and_content_combined(self):
+        agent = self._agent()
+        with patch("urllib.request.urlopen", return_value=_ollama_ctx(content="Answer", thinking="reasoning")):
+            result = agent._call_ollama([{"role": "user", "content": "hi"}])
+        assert "<think>reasoning</think>" in result
+        assert "Answer" in result
+
+    def test_empty_response_returns_empty_string(self):
+        agent = self._agent()
+        with patch("urllib.request.urlopen", return_value=_ollama_ctx()):
+            result = agent._call_ollama([{"role": "user", "content": "hi"}])
+        assert result == ""
 
 
 # ---------------------------------------------------------------------------
@@ -411,3 +473,13 @@ class TestSolve:
         agent.client.messages.create.return_value = _mock_response(crash_code)
         output = agent.predict(simple_task)
         assert output is None
+
+    def test_solve_extracts_code_from_think_block(self, simple_task):
+        """Code embedded inside <think> tags should be found via the raw-response fallback."""
+        agent = make_agent()
+        code_block = "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
+        # Entire response is inside <think>; stripping it leaves nothing
+        response = f"<think>Let me reason...\n{code_block}\n</think>"
+        agent.client.messages.create.return_value = _mock_response(response)
+        result = agent.solve(simple_task)
+        assert result["success"]

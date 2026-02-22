@@ -76,6 +76,7 @@ _SYSTEM_PROMPT = textwrap.dedent("""
 """).strip()
 
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 DEFAULT_OLLAMA_MODEL = "deepseek-r1:70b"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
@@ -119,6 +120,8 @@ class SingleAgent:
         backend: str = "ollama",
         model: str | None = None,
         max_retries: int = 3,
+        timeout: float = 120.0,
+        debug: bool = False,
     ):
         """
         Args:
@@ -126,14 +129,18 @@ class SingleAgent:
             model:       Model name. Defaults to deepseek-r1:70b for ollama,
                          claude-sonnet-4-6 for anthropic.
             max_retries: Number of self-correction attempts after first try.
+            timeout:     Seconds to wait for a single model call (ollama only).
+            debug:       Print raw model responses for troubleshooting.
         """
         self.backend = backend
         self.max_retries = max_retries
+        self.debug = debug
+
+        self._timeout = timeout
 
         if backend == "ollama":
-            from openai import OpenAI
             self.model = model or DEFAULT_OLLAMA_MODEL
-            self.client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+            self.client = None  # native Ollama API used directly
         elif backend == "anthropic":
             import anthropic
             self.model = model or DEFAULT_ANTHROPIC_MODEL
@@ -168,9 +175,15 @@ class SingleAgent:
             response_text = self._call_model(messages)
             messages.append({"role": "assistant", "content": response_text})
 
-            # Strip chain-of-thought thinking tags before extracting code
+            # Strip chain-of-thought thinking tags before extracting code.
+            # Fall back to the raw response in case the model put code inside <think>.
             clean_response = _strip_thinking(response_text)
-            code = self._extract_code(clean_response)
+            code = self._extract_code(clean_response) or self._extract_code(response_text)
+
+            if self.debug:
+                print(f"\n--- RAW MODEL RESPONSE (attempt {attempt}) ---")
+                print(response_text[:3000])
+                print(f"--- END (code extracted: {code is not None}) ---\n")
 
             if code is None:
                 entry = {"attempt": attempt, "error": "no_code_block", "n_correct": 0}
@@ -358,11 +371,36 @@ class SingleAgent:
         return response.content[0].text
 
     def _call_ollama(self, messages: list[dict]) -> str:
+        import json
+        import urllib.request
+
         full_messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + messages
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=full_messages,
-            max_tokens=8192,
-            temperature=0.6,  # recommended for deepseek-r1
+        payload = json.dumps({
+            "model": self.model,
+            "messages": full_messages,
+            "stream": False,
+            "options": {"temperature": 0.6, "num_predict": 16000},
+        }).encode()
+
+        req = urllib.request.Request(
+            OLLAMA_CHAT_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        return response.choices[0].message.content
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            result = json.loads(resp.read())
+
+        msg = result.get("message", {})
+        content = msg.get("content", "")
+        thinking = msg.get("thinking", "")
+
+        if self.debug:
+            print(f"[debug] content length={len(content)}  thinking length={len(thinking)}")
+
+        # Reassemble so _strip_thinking can handle it uniformly
+        if thinking and content:
+            return f"<think>{thinking}</think>\n{content}"
+        if thinking:
+            return f"<think>{thinking}</think>"
+        return content
