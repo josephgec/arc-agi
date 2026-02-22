@@ -2,14 +2,17 @@
 """Run the single-agent baseline on ARC-AGI tasks.
 
 Usage:
-  # Solve one task and print details:
+  # Solve one task with Ollama/deepseek-r1 (default):
   python run_baseline.py --task data/data/training/007bbfb7.json
 
-  # Solve first 10 training tasks:
+  # Solve first 10 tasks:
   python run_baseline.py --dir data/data/training --limit 10
 
-  # Solve all training tasks (expensive):
-  python run_baseline.py --dir data/data/training
+  # Use Anthropic backend:
+  python run_baseline.py --task data/data/training/007bbfb7.json --backend anthropic
+
+  # Use a different local model:
+  python run_baseline.py --task data/data/training/007bbfb7.json --model qwen2.5-coder:32b
 """
 from __future__ import annotations
 
@@ -87,12 +90,15 @@ def main() -> None:
     group.add_argument("--task", type=Path, help="Path to a single task JSON file")
     group.add_argument("--dir", type=Path, help="Directory of task JSON files")
     parser.add_argument("--limit", type=int, default=None, help="Max number of tasks to run")
-    parser.add_argument("--model", default="claude-sonnet-4-6", help="Claude model ID")
+    parser.add_argument("--backend", default="ollama", choices=["ollama", "anthropic"],
+                        help="LLM backend (default: ollama)")
+    parser.add_argument("--model", default=None,
+                        help="Model name (default: deepseek-r1:70b for ollama, claude-sonnet-4-6 for anthropic)")
     parser.add_argument("--retries", type=int, default=3, help="Max self-correction retries")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-task details")
     args = parser.parse_args()
 
-    agent = SingleAgent(model=args.model, max_retries=args.retries)
+    agent = SingleAgent(backend=args.backend, model=args.model, max_retries=args.retries)
     results: list[dict] = []
 
     if args.task:
@@ -103,7 +109,8 @@ def main() -> None:
         if args.limit:
             task_files = task_files[: args.limit]
 
-        print(f"Running baseline on {len(task_files)} tasks  (model={args.model}, retries={args.retries})")
+        model_label = args.model or f"default ({args.backend})"
+        print(f"Running baseline on {len(task_files)} tasks  (backend={args.backend}, model={model_label}, retries={args.retries})")
 
         n_solved = 0
         for i, path in enumerate(task_files, 1):

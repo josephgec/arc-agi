@@ -2,10 +2,14 @@
 
 Flow per task:
   1. Format all training pairs as a prompt
-  2. Ask Claude to write `def transform(grid: np.ndarray) -> np.ndarray`
+  2. Ask the model to write `def transform(grid: np.ndarray) -> np.ndarray`
   3. Extract and execute the function
   4. If any training pair is wrong, feed pixel-level errors back and ask to fix
   5. Repeat up to max_retries
+
+Backends:
+  - "ollama"     : local Ollama server (default, free, runs deepseek-r1:70b)
+  - "anthropic"  : Anthropic API (requires credits)
 """
 from __future__ import annotations
 
@@ -15,7 +19,6 @@ import traceback
 from typing import Any
 
 import numpy as np
-import anthropic
 
 from arc.grid import Grid, grids_equal, COLOR_NAMES
 from arc.dsl import (
@@ -72,6 +75,15 @@ _SYSTEM_PROMPT = textwrap.dedent("""
     - Before the code block, briefly explain your reasoning (chain of thought).
 """).strip()
 
+OLLAMA_BASE_URL = "http://localhost:11434/v1"
+DEFAULT_OLLAMA_MODEL = "deepseek-r1:70b"
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks produced by deepseek-r1 and similar models."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
 
 def _grid_to_str(grid: Grid) -> str:
     """Render a grid as a compact Python list literal (for prompts)."""
@@ -84,16 +96,16 @@ def _grid_to_str(grid: Grid) -> str:
 def _diff_summary(expected: Grid, predicted: Grid, max_show: int = 12) -> str:
     """Summarise cell-level differences between two grids."""
     if expected.shape != predicted.shape:
-        return (
-            f"Shape mismatch: expected {expected.shape}, got {predicted.shape}"
-        )
+        return f"Shape mismatch: expected {expected.shape}, got {predicted.shape}"
     diffs = []
     it = np.nditer([expected, predicted], flags=["multi_index"])
     while not it.finished:
         r, c = it.multi_index
         ev, pv = int(it[0]), int(it[1])
         if ev != pv:
-            diffs.append(f"  ({r},{c}) expected {ev} ({COLOR_NAMES[ev]}) got {pv} ({COLOR_NAMES[pv]})")
+            diffs.append(
+                f"  ({r},{c}) expected {ev} ({COLOR_NAMES[ev]}) got {pv} ({COLOR_NAMES[pv]})"
+            )
         it.iternext()
     if not diffs:
         return "  (no differences)"
@@ -104,12 +116,30 @@ def _diff_summary(expected: Grid, predicted: Grid, max_show: int = 12) -> str:
 class SingleAgent:
     def __init__(
         self,
-        model: str = "claude-sonnet-4-6",
+        backend: str = "ollama",
+        model: str | None = None,
         max_retries: int = 3,
     ):
-        self.model = model
+        """
+        Args:
+            backend:     "ollama" (local, free) or "anthropic" (API credits required)
+            model:       Model name. Defaults to deepseek-r1:70b for ollama,
+                         claude-sonnet-4-6 for anthropic.
+            max_retries: Number of self-correction attempts after first try.
+        """
+        self.backend = backend
         self.max_retries = max_retries
-        self.client = anthropic.Anthropic()
+
+        if backend == "ollama":
+            from openai import OpenAI
+            self.model = model or DEFAULT_OLLAMA_MODEL
+            self.client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+        elif backend == "anthropic":
+            import anthropic
+            self.model = model or DEFAULT_ANTHROPIC_MODEL
+            self.client = anthropic.Anthropic()
+        else:
+            raise ValueError(f"Unknown backend '{backend}'. Choose 'ollama' or 'anthropic'.")
 
     # ------------------------------------------------------------------
     # Public API
@@ -121,25 +151,27 @@ class SingleAgent:
         Returns:
             {
                 'success': bool,
-                'code': str | None,          # best code found
+                'code': str | None,
                 'n_attempts': int,
-                'log': list[dict],           # per-attempt details
+                'log': list[dict],
             }
         """
         log: list[dict] = []
         messages: list[dict] = []
 
-        # First message: the task
         messages.append({"role": "user", "content": self._format_task_prompt(task)})
 
         best_code: str | None = None
         best_n_correct: int = -1
 
-        for attempt in range(1, self.max_retries + 2):  # +1 because first pass isn't a "retry"
-            response_text = self._call_claude(messages)
+        for attempt in range(1, self.max_retries + 2):
+            response_text = self._call_model(messages)
             messages.append({"role": "assistant", "content": response_text})
 
-            code = self._extract_code(response_text)
+            # Strip chain-of-thought thinking tags before extracting code
+            clean_response = _strip_thinking(response_text)
+            code = self._extract_code(clean_response)
+
             if code is None:
                 entry = {"attempt": attempt, "error": "no_code_block", "n_correct": 0}
                 log.append(entry)
@@ -174,7 +206,6 @@ class SingleAgent:
                     "log": log,
                 }
 
-            # Not all correct — build feedback and loop (if retries remain)
             if attempt <= self.max_retries:
                 messages.append({
                     "role": "user",
@@ -189,10 +220,7 @@ class SingleAgent:
         }
 
     def predict(self, task: dict) -> Grid | None:
-        """Solve the task and apply the winning code to the test input.
-
-        Returns the predicted output Grid, or None if solving failed.
-        """
+        """Solve and apply the best code to the test input."""
         result = self.solve(task)
         if result["code"] is None:
             return None
@@ -238,10 +266,14 @@ class SingleAgent:
             if pair["error"]:
                 lines.append(f"  Exception: {pair['error']}")
             else:
-                lines.append(f"  Expected  ({pair['expected'].shape[0]}×{pair['expected'].shape[1]}):\n"
-                             f"  {_grid_to_str(pair['expected'])}")
-                lines.append(f"  Got       ({pair['predicted'].shape[0]}×{pair['predicted'].shape[1]}):\n"
-                             f"  {_grid_to_str(pair['predicted'])}")
+                lines.append(
+                    f"  Expected  ({pair['expected'].shape[0]}×{pair['expected'].shape[1]}):\n"
+                    f"  {_grid_to_str(pair['expected'])}"
+                )
+                lines.append(
+                    f"  Got       ({pair['predicted'].shape[0]}×{pair['predicted'].shape[1]}):\n"
+                    f"  {_grid_to_str(pair['predicted'])}"
+                )
                 lines.append("  Cell differences:\n" + _diff_summary(pair["expected"], pair["predicted"]))
             lines.append("")
         lines.append("Please revise your reasoning and write a corrected `transform` function.")
@@ -255,14 +287,12 @@ class SingleAgent:
         match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
         if match:
             return match.group(1).strip()
-        # fallback: look for bare def transform(
         match = re.search(r"(def transform\(.*)", text, re.DOTALL)
         if match:
             return match.group(1).strip()
         return None
 
     def _execute(self, code: str, input_grid: Grid) -> tuple[Grid | None, str | None]:
-        """Execute the generated code and return (output, error)."""
         namespace = dict(_DSL_NAMESPACE)
         try:
             exec(code, namespace)  # noqa: S102
@@ -310,14 +340,29 @@ class SingleAgent:
         }
 
     # ------------------------------------------------------------------
-    # Claude API
+    # Model API (backend-agnostic)
     # ------------------------------------------------------------------
 
-    def _call_claude(self, messages: list[dict]) -> str:
+    def _call_model(self, messages: list[dict]) -> str:
+        if self.backend == "anthropic":
+            return self._call_anthropic(messages)
+        return self._call_ollama(messages)
+
+    def _call_anthropic(self, messages: list[dict]) -> str:
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=8192,
             system=_SYSTEM_PROMPT,
             messages=messages,
         )
         return response.content[0].text
+
+    def _call_ollama(self, messages: list[dict]) -> str:
+        full_messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + messages
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=full_messages,
+            max_tokens=8192,
+            temperature=0.6,  # recommended for deepseek-r1
+        )
+        return response.choices[0].message.content

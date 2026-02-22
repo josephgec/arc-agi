@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from agents.single_agent import SingleAgent, _grid_to_str, _diff_summary
+from agents.single_agent import SingleAgent, _grid_to_str, _diff_summary, _strip_thinking
 
 
 # ---------------------------------------------------------------------------
@@ -14,17 +14,69 @@ from agents.single_agent import SingleAgent, _grid_to_str, _diff_summary
 # ---------------------------------------------------------------------------
 
 def make_agent() -> SingleAgent:
-    """Return a SingleAgent with a mocked Anthropic client."""
-    with patch("agents.single_agent.anthropic.Anthropic"):
-        agent = SingleAgent(model="claude-sonnet-4-6", max_retries=2)
+    """Return a SingleAgent backed by mocked Anthropic client."""
+    with patch("anthropic.Anthropic"):
+        agent = SingleAgent(backend="anthropic", model="claude-sonnet-4-6", max_retries=2)
     agent.client = MagicMock()
     return agent
 
 
 def _mock_response(text: str) -> MagicMock:
+    """Simulate an Anthropic API response."""
     msg = MagicMock()
     msg.content = [MagicMock(text=text)]
     return msg
+
+
+# ---------------------------------------------------------------------------
+# _strip_thinking
+# ---------------------------------------------------------------------------
+
+class TestStripThinking:
+    def test_removes_think_block(self):
+        text = "<think>\nsome internal reasoning\n</think>\nActual answer"
+        assert _strip_thinking(text) == "Actual answer"
+
+    def test_no_think_block_unchanged(self):
+        text = "Normal response without thinking."
+        assert _strip_thinking(text) == text
+
+    def test_multiline_think_block(self):
+        text = "<think>\nline1\nline2\nline3\n</think>\n```python\ndef transform(g): return g\n```"
+        result = _strip_thinking(text)
+        assert "<think>" not in result
+        assert "def transform" in result
+
+    def test_empty_think_block(self):
+        text = "<think></think>answer"
+        assert _strip_thinking(text) == "answer"
+
+
+# ---------------------------------------------------------------------------
+# SingleAgent init
+# ---------------------------------------------------------------------------
+
+class TestSingleAgentInit:
+    def test_ollama_backend(self):
+        with patch("openai.OpenAI"):
+            agent = SingleAgent(backend="ollama")
+        assert agent.backend == "ollama"
+        assert "deepseek" in agent.model
+
+    def test_anthropic_backend(self):
+        with patch("anthropic.Anthropic"):
+            agent = SingleAgent(backend="anthropic")
+        assert agent.backend == "anthropic"
+        assert "claude" in agent.model
+
+    def test_custom_model_overrides_default(self):
+        with patch("openai.OpenAI"):
+            agent = SingleAgent(backend="ollama", model="qwen2.5:32b")
+        assert agent.model == "qwen2.5:32b"
+
+    def test_invalid_backend_raises(self):
+        with pytest.raises(ValueError, match="Unknown backend"):
+            SingleAgent(backend="invalid")
 
 
 # ---------------------------------------------------------------------------
