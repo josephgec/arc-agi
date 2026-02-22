@@ -1,0 +1,7 @@
+anthropic>=0.40.0
+numpy
+scipy
+matplotlib
+python-dotenv
+pytest
+pytest-cov
