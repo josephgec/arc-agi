@@ -248,6 +248,13 @@ class TestCallOllama:
             result = agent._call_ollama([{"role": "user", "content": "hi"}])
         assert result == ""
 
+    def test_timeout_raises_timeout_error(self):
+        import socket
+        agent = self._agent()
+        with patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")):
+            with pytest.raises(TimeoutError):
+                agent._call_ollama([{"role": "user", "content": "hi"}])
+
 
 # ---------------------------------------------------------------------------
 # _execute
@@ -473,6 +480,14 @@ class TestSolve:
         agent.client.messages.create.return_value = _mock_response(crash_code)
         output = agent.predict(simple_task)
         assert output is None
+
+    def test_solve_logs_timeout_and_does_not_crash(self, simple_task):
+        """A TimeoutError from the model call should be logged, not raised."""
+        agent = make_agent()
+        agent.client.messages.create.side_effect = TimeoutError("timed out")
+        result = agent.solve(simple_task)
+        assert not result["success"]
+        assert any("timeout" in str(e.get("error", "")) for e in result["log"])
 
     def test_solve_extracts_code_from_think_block(self, simple_task):
         """Code embedded inside <think> tags should be found via the raw-response fallback."""

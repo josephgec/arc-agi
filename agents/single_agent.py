@@ -172,7 +172,12 @@ class SingleAgent:
         best_n_correct: int = -1
 
         for attempt in range(1, self.max_retries + 2):
-            response_text = self._call_model(messages)
+            try:
+                response_text = self._call_model(messages)
+            except TimeoutError as e:
+                entry = {"attempt": attempt, "error": f"timeout: {e}", "n_correct": 0}
+                log.append(entry)
+                break
             messages.append({"role": "assistant", "content": response_text})
 
             # Strip chain-of-thought thinking tags before extracting code.
@@ -382,14 +387,20 @@ class SingleAgent:
             "options": {"temperature": 0.6, "num_predict": 16000},
         }).encode()
 
+        import socket
+        import urllib.error
+
         req = urllib.request.Request(
             OLLAMA_CHAT_URL,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-            result = json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                result = json.loads(resp.read())
+        except (socket.timeout, urllib.error.URLError) as e:
+            raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
 
         msg = result.get("message", {})
         content = msg.get("content", "")
