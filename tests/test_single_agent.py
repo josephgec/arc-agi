@@ -285,6 +285,54 @@ class TestExtractCode:
         code = agent._extract_code(text)
         assert "return grid.copy()" in code
 
+    def test_prose_trailing_function_trimmed(self):
+        """Code block with prose after the function body should be salvaged."""
+        agent = make_agent()
+        text = (
+            "```python\n"
+            "def transform(grid):\n"
+            "    return grid.copy()\n"
+            "\n"
+            "Then we test it with example 1.\n"  # prose trailing after function
+            "Output: [[1,2],[3,4]]\n"
+            "```"
+        )
+        code = agent._extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+        assert "Then we test" not in code
+
+
+# ---------------------------------------------------------------------------
+# _truncate_to_valid_function
+# ---------------------------------------------------------------------------
+
+class TestTruncateToValidFunction:
+    def test_clean_function_unchanged(self):
+        from agents.single_agent import SingleAgent
+        block = "def transform(grid):\n    return grid.copy()"
+        result = SingleAgent._truncate_to_valid_function(block)
+        assert result is not None
+        assert "def transform" in result
+
+    def test_prose_suffix_removed(self):
+        from agents.single_agent import SingleAgent
+        block = "def transform(grid):\n    return grid.copy()\n\nThen test it.\nOutput: [[1]]"
+        result = SingleAgent._truncate_to_valid_function(block)
+        assert result is not None
+        assert "Then test it" not in result
+        assert "def transform" in result
+
+    def test_returns_none_for_pure_prose(self):
+        from agents.single_agent import SingleAgent
+        result = SingleAgent._truncate_to_valid_function("This is just prose.")
+        assert result is None
+
+    def test_returns_none_for_no_def(self):
+        from agents.single_agent import SingleAgent
+        result = SingleAgent._truncate_to_valid_function("x = 1\ny = 2")
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # _block_analysis

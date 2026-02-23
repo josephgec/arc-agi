@@ -107,6 +107,8 @@ _SYSTEM_PROMPT = textwrap.dedent("""
     - Signature must be exactly:  def transform(grid: np.ndarray) -> np.ndarray
     - Return a NEW numpy int32 array — never modify the input in place.
     - No imports, no print statements, no top-level code outside the function.
+    - Do NOT use input(), sys.stdin, open(), or any I/O — the grid is passed directly.
+    - Do NOT output grid literals or test code — only the function definition.
 """).strip()
 
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
@@ -319,11 +321,29 @@ class SingleAgent:
                 lines.append(f"  block({r},{c}): input[{r}][{c}]={cell_val} → {desc}")
         return "\n".join(lines)
 
+    # Max cells (input + output) per pair before we cap the number of pairs shown
+    _LARGE_GRID_CELL_THRESHOLD = 300
+    _LARGE_GRID_MAX_PAIRS = 2
+
     def _format_task_prompt(self, task: dict) -> str:
         parts = [
             "Here is an ARC-AGI puzzle. Study the training examples and find the transformation rule.\n"
         ]
-        for i, pair in enumerate(task["train"]):
+        train_pairs = task["train"]
+        # For tasks with large grids, cap the number of pairs to avoid context overflow
+        max_cells = max(
+            inp.size + out.size
+            for p in train_pairs
+            for inp, out in [(p["input"], p["output"])]
+        )
+        if max_cells > self._LARGE_GRID_CELL_THRESHOLD:
+            train_pairs = train_pairs[: self._LARGE_GRID_MAX_PAIRS]
+            parts.append(
+                f"(Note: grids are large; showing {len(train_pairs)} of "
+                f"{len(task['train'])} training pairs.)\n"
+            )
+
+        for i, pair in enumerate(train_pairs):
             inp = pair["input"]
             out = pair["output"]
             parts.append(f"### Training pair {i + 1}")
@@ -372,13 +392,45 @@ class SingleAgent:
     # Code extraction & execution
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _truncate_to_valid_function(block: str) -> str | None:
+        """Given a block that may have prose after the function body, trim trailing
+        lines until the block is valid Python containing a def.  Returns the
+        longest valid prefix, or None if none exists."""
+        import ast
+        lines = block.split("\n")
+        for end in range(len(lines), 0, -1):
+            candidate = "\n".join(lines[:end]).strip()
+            if "def " not in candidate:
+                continue
+            try:
+                ast.parse(candidate)
+                return candidate
+            except SyntaxError:
+                continue
+        return None
+
     def _extract_code(self, text: str) -> str | None:
-        # Take the LAST code block — reasoning models iterate and refine,
-        # so the final block is the most correct.
-        matches = re.findall(r"```python\s*(.*?)```", text, re.DOTALL)
+        # Collect all fenced code blocks (case-insensitive lang tag).
+        # Reasoning models iterate through many drafts; we want the last block
+        # that actually contains a function definition and is valid Python.
+        matches = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
         if matches:
-            return matches[-1].strip()
-        match = re.search(r"(def transform\(.*)", text, re.DOTALL)
+            import ast
+            for block in reversed(matches):
+                block = block.strip()
+                if "def " in block:
+                    try:
+                        ast.parse(block)
+                        return block  # last syntactically-valid block with a def
+                    except SyntaxError:
+                        # Prose may trail the function — try to trim it off
+                        trimmed = self._truncate_to_valid_function(block)
+                        if trimmed:
+                            return trimmed
+            # Nothing valid found
+            return None
+        match = re.search(r"(def \w+\(.*)", text, re.DOTALL)
         if match:
             return match.group(1).strip()
         return None
@@ -386,6 +438,9 @@ class SingleAgent:
     def _execute(self, code: str, input_grid: Grid) -> tuple[Grid | None, str | None]:
         import io
         import contextlib
+
+        if "input(" in code or "sys.stdin" in code:
+            return None, "Code uses input()/stdin — not allowed; grid is passed as argument."
 
         namespace = dict(_DSL_NAMESPACE)
         try:
