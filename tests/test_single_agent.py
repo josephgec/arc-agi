@@ -172,6 +172,40 @@ class TestFormatTaskPrompt:
         prompt = agent._format_task_prompt(simple_task)
         assert "Training pair 2" in prompt
 
+    def test_large_grid_caps_pairs_shown(self):
+        """Tasks with large grids (>300 cells/pair) should cap training pairs shown."""
+        # 20×20 = 400 cells > threshold of 300
+        big = np.zeros((20, 20), dtype=np.int32)
+        task = {
+            "train": [
+                {"input": big.copy(), "output": big.copy()},
+                {"input": big.copy(), "output": big.copy()},
+                {"input": big.copy(), "output": big.copy()},
+                {"input": big.copy(), "output": big.copy()},
+            ],
+            "test": [{"input": big.copy()}],
+        }
+        agent = make_agent()
+        prompt = agent._format_task_prompt(task)
+        # Should show at most _LARGE_GRID_MAX_PAIRS (2) pairs
+        from agents.single_agent import SingleAgent
+        assert "Training pair 3" not in prompt
+
+    def test_small_grid_shows_all_pairs(self):
+        """Small grids should not be truncated."""
+        small = np.ones((2, 2), dtype=np.int32)
+        task = {
+            "train": [
+                {"input": small.copy(), "output": small.copy()},
+                {"input": small.copy(), "output": small.copy()},
+                {"input": small.copy(), "output": small.copy()},
+            ],
+            "test": [{"input": small.copy()}],
+        }
+        agent = make_agent()
+        prompt = agent._format_task_prompt(task)
+        assert "Training pair 3" in prompt
+
 
 # ---------------------------------------------------------------------------
 # _extract_code
@@ -222,6 +256,34 @@ class TestExtractCode:
         )
         code = agent._extract_code(blocks)
         assert "return grid + 4" in code
+
+    def test_grid_literal_block_rejected(self):
+        """A code block containing only a grid literal (no def) returns None."""
+        agent = make_agent()
+        text = "```python\n[[1, 2], [3, 4]]\n```"
+        code = agent._extract_code(text)
+        assert code is None
+
+    def test_prefers_def_block_over_grid_literal(self):
+        """When both a grid literal and a def block exist, the def block wins."""
+        agent = make_agent()
+        text = (
+            "```python\n[[1, 2], [3, 4]]\n```\n"
+            "```python\ndef transform(grid):\n    return grid.copy()\n```"
+        )
+        code = agent._extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+
+    def test_ast_valid_block_preferred_over_invalid(self):
+        """Returns the last syntactically-valid block with a def."""
+        agent = make_agent()
+        text = (
+            "```python\ndef transform(grid):\n    return grid +\n```\n"  # syntax error
+            "```python\ndef transform(grid):\n    return grid.copy()\n```"
+        )
+        code = agent._extract_code(text)
+        assert "return grid.copy()" in code
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +485,23 @@ class TestExecute:
         original_val = int(original[0, 0])
         agent._execute(code, original)
         assert original[0, 0] == original_val
+
+    def test_stdin_input_call_rejected(self):
+        """Code using input() must be rejected with a descriptive error."""
+        agent = make_agent()
+        code = "def transform(grid):\n    n = int(input())\n    return grid"
+        output, error = agent._execute(code, self._g())
+        assert output is None
+        assert error is not None
+        assert "stdin" in error.lower() or "input" in error.lower()
+
+    def test_stdin_sys_stdin_rejected(self):
+        """Code using sys.stdin must be rejected."""
+        agent = make_agent()
+        code = "import sys\ndef transform(grid):\n    data = sys.stdin.read()\n    return grid"
+        output, error = agent._execute(code, self._g())
+        assert output is None
+        assert error is not None
 
 
 # ---------------------------------------------------------------------------
