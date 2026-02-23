@@ -396,14 +396,25 @@ class TestBlockAnalysis:
 # ---------------------------------------------------------------------------
 
 def _ollama_ctx(content: str = "", thinking: str = "") -> MagicMock:
-    """Return a context-manager mock for urllib.request.urlopen."""
-    body = json.dumps(
-        {"message": {"role": "assistant", "content": content, "thinking": thinking}}
-    ).encode()
+    """Return a context-manager mock for urllib.request.urlopen (streaming NDJSON)."""
+    lines: list[bytes] = []
+    if thinking:
+        lines.append(
+            json.dumps({"message": {"content": "", "thinking": thinking}, "done": False}).encode() + b"\n"
+        )
+    if content:
+        lines.append(
+            json.dumps({"message": {"content": content, "thinking": ""}, "done": False}).encode() + b"\n"
+        )
+    lines.append(
+        json.dumps({"message": {"content": "", "thinking": ""}, "done": True}).encode() + b"\n"
+    )
+
     cm = MagicMock()
     cm.__enter__ = MagicMock(return_value=cm)
     cm.__exit__ = MagicMock(return_value=False)
-    cm.read = MagicMock(return_value=body)
+    # Streaming: iterating the response yields NDJSON lines
+    cm.__iter__ = lambda self: iter(lines)
     return cm
 
 
@@ -442,6 +453,35 @@ class TestCallOllama:
         with patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")):
             with pytest.raises(TimeoutError):
                 agent._call_ollama([{"role": "user", "content": "hi"}])
+
+    def test_partial_result_returned_on_deadline(self):
+        """When the deadline is exceeded mid-stream, partial thinking is returned."""
+        import time
+        agent = SingleAgent(backend="ollama", timeout=0.001)  # nearly-zero deadline
+        # The mock immediately yields done=False, then done=True — but deadline fires first
+        thinking_chunk = json.dumps({
+            "message": {"content": "", "thinking": "partial thinking"},
+            "done": False,
+        }).encode() + b"\n"
+        done_chunk = json.dumps({
+            "message": {"content": "", "thinking": ""},
+            "done": True,
+        }).encode() + b"\n"
+
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=cm)
+        cm.__exit__ = MagicMock(return_value=False)
+        # Simulate slow iteration so deadline fires between chunks
+        def slow_iter():
+            yield thinking_chunk
+            time.sleep(0.01)   # sleep past the 0.001s deadline
+            yield done_chunk
+        cm.__iter__ = lambda self: slow_iter()
+
+        with patch("urllib.request.urlopen", return_value=cm):
+            result = agent._call_ollama([{"role": "user", "content": "hi"}])
+        # Should return the partial thinking, not raise TimeoutError
+        assert "partial thinking" in result
 
 
 # ---------------------------------------------------------------------------

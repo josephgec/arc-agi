@@ -519,21 +519,21 @@ class SingleAgent:
 
     def _call_ollama(self, messages: list[dict], temperature: float = 0.0) -> str:
         import json
+        import socket
+        import time
+        import urllib.error
         import urllib.request
 
         full_messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + messages
         payload = json.dumps({
             "model": self.model,
             "messages": full_messages,
-            "stream": False,
+            "stream": True,  # stream so we can exit early & recover partial results
             "options": {
                 "temperature": temperature,
-                "num_predict": -1,  # unlimited: let model finish; timeout controls duration
+                "num_predict": -1,  # unlimited: let timeout control duration
             },
         }).encode()
-
-        import socket
-        import urllib.error
 
         req = urllib.request.Request(
             OLLAMA_CHAT_URL,
@@ -541,19 +541,55 @@ class SingleAgent:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+
+        thinking_parts: list[str] = []
+        content_parts: list[str] = []
+        # Per-read socket timeout: shorter than overall deadline so we can check
+        # wall-clock time between chunks.
+        _READ_TIMEOUT = min(self._timeout, 60)
+        deadline = time.monotonic() + self._timeout
+
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                result = json.loads(resp.read())
+            with urllib.request.urlopen(req, timeout=_READ_TIMEOUT) as resp:
+                for raw_line in resp:
+                    try:
+                        chunk = json.loads(raw_line.strip())
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+                    msg = chunk.get("message", {})
+                    thinking_parts.append(msg.get("thinking") or "")
+                    content_parts.append(msg.get("content") or "")
+
+                    if chunk.get("done"):
+                        break
+
+                    # Early exit: complete code block found in content
+                    content_so_far = "".join(content_parts)
+                    if (
+                        content_so_far.count("```") >= 2
+                        and "def " in content_so_far
+                        and re.search(r"```(?:python)?\s.*?```", content_so_far, re.DOTALL | re.IGNORECASE)
+                    ):
+                        break
+
+                    # Deadline check (wall clock)
+                    if time.monotonic() > deadline:
+                        break
+
         except socket.timeout as e:
-            raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
+            # Per-read socket timeout — treat as overall timeout only if we got nothing
+            if not thinking_parts and not content_parts:
+                raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
         except urllib.error.URLError as e:
             if isinstance(e.reason, socket.timeout):
-                raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
-            raise
+                if not thinking_parts and not content_parts:
+                    raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
+            else:
+                raise
 
-        msg = result.get("message", {})
-        content = msg.get("content", "")
-        thinking = msg.get("thinking", "")
+        thinking = "".join(thinking_parts)
+        content = "".join(content_parts)
 
         if self.debug:
             print(f"[debug] content length={len(content)}  thinking length={len(thinking)}")
