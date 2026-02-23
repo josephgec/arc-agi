@@ -202,6 +202,84 @@ class TestExtractCode:
         code = agent._extract_code(text)
         assert not code.startswith("\n")
 
+    def test_returns_last_block_not_first(self):
+        """Reasoning models iterate — the last code block is most refined."""
+        agent = make_agent()
+        text = (
+            "First attempt:\n```python\ndef transform(grid):\n    return grid * 0\n```\n"
+            "Correction:\n```python\ndef transform(grid):\n    return grid.copy()\n```"
+        )
+        code = agent._extract_code(text)
+        assert "return grid.copy()" in code
+        assert "return grid * 0" not in code
+
+    def test_multiple_blocks_last_is_returned(self):
+        """With 3+ blocks, the very last one is returned."""
+        agent = make_agent()
+        blocks = "\n".join(
+            f"```python\ndef transform(grid):\n    return grid + {i}\n```"
+            for i in range(5)
+        )
+        code = agent._extract_code(blocks)
+        assert "return grid + 4" in code
+
+
+# ---------------------------------------------------------------------------
+# _block_analysis
+# ---------------------------------------------------------------------------
+
+class TestBlockAnalysis:
+    def _inp(self):
+        return np.array([[0, 1], [1, 0]], dtype=np.int32)
+
+    def test_returns_none_when_not_divisible(self):
+        inp = np.array([[1, 2, 3]], dtype=np.int32)
+        out = np.array([[1, 2, 3, 4]], dtype=np.int32)
+        assert SingleAgent._block_analysis(inp, out) is None
+
+    def test_returns_string_for_divisible_output(self):
+        inp = self._inp()
+        out = np.tile(inp, (2, 2))  # 4×4 — two blocks each direction
+        result = SingleAgent._block_analysis(inp, out)
+        assert isinstance(result, str)
+
+    def test_identifies_all_zeros_block(self):
+        inp = np.array([[0, 1], [1, 1]], dtype=np.int32)
+        # Manually build a 4×4 output where block(0,0) is zeros
+        out = np.zeros((4, 4), dtype=np.int32)
+        out[0:2, 2:4] = inp  # block(0,1) = inp
+        out[2:4, 0:2] = inp  # block(1,0) = inp
+        out[2:4, 2:4] = inp  # block(1,1) = inp
+        analysis = SingleAgent._block_analysis(inp, out)
+        assert "all zeros" in analysis
+
+    def test_identifies_input_grid_block(self):
+        inp = self._inp()
+        # block(0,0) = inp, rest zeros
+        out = np.zeros((4, 4), dtype=np.int32)
+        out[0:2, 0:2] = inp
+        analysis = SingleAgent._block_analysis(inp, out)
+        assert "input grid" in analysis.lower()
+
+    def test_block_positions_referenced(self):
+        inp = self._inp()
+        out = np.tile(inp, (2, 2))
+        analysis = SingleAgent._block_analysis(inp, out)
+        assert "block(0,0)" in analysis
+        assert "block(1,1)" in analysis
+
+    def test_prompt_includes_analysis_when_output_is_multiple_of_input(self):
+        """_format_task_prompt should embed block analysis for tiling tasks."""
+        inp = np.array([[0, 1], [1, 0]], dtype=np.int32)
+        out = np.tile(inp, (2, 2))
+        task = {
+            "train": [{"input": inp, "output": out}],
+            "test": [{"input": inp}],
+        }
+        agent = make_agent()
+        prompt = agent._format_task_prompt(task)
+        assert "block(" in prompt
+
 
 # ---------------------------------------------------------------------------
 # _call_ollama — native Ollama API (urllib mocked)
@@ -320,6 +398,23 @@ class TestExecute:
         output, error = agent._execute(code, self._g())
         assert error is None
         assert output.shape == (2, 2)
+
+    def test_fallback_to_any_callable_when_no_transform(self):
+        """If the model names the function differently, we still use it."""
+        agent = make_agent()
+        code = "def my_func(grid):\n    return grid.copy()"
+        output, error = agent._execute(code, self._g())
+        assert error is None
+        np.testing.assert_array_equal(output, self._g())
+
+    def test_fallback_ignores_dsl_helpers(self):
+        """The fallback should not accidentally pick a DSL function."""
+        agent = make_agent()
+        # Only a non-transform name defined; DSL names should be ignored
+        code = "def solve(grid):\n    return np.zeros((1, 1), dtype=np.int32)"
+        output, error = agent._execute(code, self._g())
+        assert error is None
+        assert output.shape == (1, 1)
 
     def test_input_not_mutated(self):
         agent = make_agent()

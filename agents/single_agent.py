@@ -111,7 +111,7 @@ _SYSTEM_PROMPT = textwrap.dedent("""
 
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-DEFAULT_OLLAMA_MODEL = "deepseek-r1:70b"
+DEFAULT_OLLAMA_MODEL = "deepseek-r1:8b"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
 
