@@ -526,7 +526,10 @@ class SingleAgent:
             "model": self.model,
             "messages": full_messages,
             "stream": False,
-            "options": {"temperature": temperature, "num_predict": 16000},
+            "options": {
+                "temperature": temperature,
+                "num_predict": -1,  # unlimited: let model finish; timeout controls duration
+            },
         }).encode()
 
         import socket
