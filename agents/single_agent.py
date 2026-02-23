@@ -58,7 +58,9 @@ _SYSTEM_PROMPT = textwrap.dedent("""
 
     DSL helpers available inside your function (already imported, no extra imports needed):
       crop(grid, r1, c1, r2, c2)        flip(grid, axis)          rotate(grid, n)
-      translate(grid, dr, dc, fill=0)   scale(grid, factor)       tile(grid, n_rows, n_cols)
+      translate(grid, dr, dc, fill=0)   scale(grid, factor)
+      tile(grid, n_rows, n_cols)  ← repeats the grid n_rows×n_cols times;
+                                    e.g. tile(3×3 grid, 3, 3) → 9×9 result
       recolor(grid, from_color, to_color)
       flood_fill(grid, row, col, new_color)
       find_objects(grid, background=None) → list of {color, pixels, bbox, subgrid}
@@ -66,10 +68,34 @@ _SYSTEM_PROMPT = textwrap.dedent("""
       mask(grid, mask_grid, fill=0)      overlay(base, top, transparent=0)
       np  (numpy is available as np)
 
+    Common code patterns:
+
+    Pattern A — "for each input cell, stamp the full input into the output block":
+        h, w = grid.shape
+        output = np.zeros((h * h, w * w), dtype=np.int32)
+        for r in range(h):
+            for c in range(w):
+                if grid[r, c] != 0:
+                    output[r*h:(r+1)*h, c*w:(c+1)*w] = grid  # full pattern, not scalar
+        # Common mistake to avoid — inner loop must use pattern indices (x, y),
+        # NOT the block position (r, c):
+        #   WRONG: output[r*h+x][c*w+y] = grid[r][c]   ← scalar from block position
+        #   RIGHT: output[r*h+x][c*w+y] = grid[x][y]   ← value from pattern position
+
+    Pattern B — simple tiling (output is N copies of input):
+        output = tile(grid, N, N)
+
+    Pattern C — recolour, flip, rotate, crop — use the DSL helpers directly.
+
     REQUIRED RESPONSE FORMAT — follow these steps in order:
 
-    STEP 1 — OBSERVE: For each training pair, describe in one sentence what changed
-    (e.g. "the 3×3 input is tiled 3 times horizontally and vertically to make a 9×9 output").
+    STEP 1 — OBSERVE: For each training pair, carefully describe what changed.
+    - If the output is larger than the input (e.g. 9×9 from 3×3), divide the output
+      into blocks the same size as the input. There will be one block per input cell.
+      For each block, state the input cell's value and exactly what that block contains.
+      Example: "input[0][0]=0 → output block(0,0) is all zeros;
+                input[0][1]=7 → output block(0,1) equals the full input grid"
+    - If the output is the same size as the input, describe cell-level changes.
 
     STEP 2 — RULE: State the single generalised rule in plain English.
 
@@ -268,6 +294,31 @@ class SingleAgent:
     # Prompt building
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _block_analysis(inp: Grid, out: Grid) -> str | None:
+        """If output is an exact NxM tiling of input-sized blocks, return a
+        pre-computed block analysis string to help the model spot the rule."""
+        ih, iw = inp.shape
+        oh, ow = out.shape
+        if oh % ih != 0 or ow % iw != 0:
+            return None
+        br, bc = oh // ih, ow // iw  # block grid dimensions
+        lines = [f"  (Output divided into {br}×{bc} blocks, each {ih}×{iw}:)"]
+        for r in range(br):
+            for c in range(bc):
+                block = out[r * ih:(r + 1) * ih, c * iw:(c + 1) * iw]
+                cell_val = int(inp[r, c]) if r < ih and c < iw else "?"
+                if np.all(block == 0):
+                    desc = "all zeros"
+                else:
+                    # Always show the actual block content so the model can see
+                    # what values appear (e.g. the full input pattern, not just the cell value)
+                    desc = _grid_to_str(block)
+                    if np.array_equal(block, inp):
+                        desc += "  ← this is the complete input grid (note: contains its own zeros too)"
+                lines.append(f"  block({r},{c}): input[{r}][{c}]={cell_val} → {desc}")
+        return "\n".join(lines)
+
     def _format_task_prompt(self, task: dict) -> str:
         parts = [
             "Here is an ARC-AGI puzzle. Study the training examples and find the transformation rule.\n"
@@ -277,7 +328,11 @@ class SingleAgent:
             out = pair["output"]
             parts.append(f"### Training pair {i + 1}")
             parts.append(f"Input  ({inp.shape[0]}×{inp.shape[1]}):\n{_grid_to_str(inp)}")
-            parts.append(f"Output ({out.shape[0]}×{out.shape[1]}):\n{_grid_to_str(out)}\n")
+            parts.append(f"Output ({out.shape[0]}×{out.shape[1]}):\n{_grid_to_str(out)}")
+            analysis = self._block_analysis(inp, out)
+            if analysis:
+                parts.append(analysis)
+            parts.append("")
 
         test_inp = task["test"][0]["input"]
         parts.append(f"### Test input ({test_inp.shape[0]}×{test_inp.shape[1]}):\n{_grid_to_str(test_inp)}\n")
@@ -318,9 +373,11 @@ class SingleAgent:
     # ------------------------------------------------------------------
 
     def _extract_code(self, text: str) -> str | None:
-        match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
+        # Take the LAST code block — reasoning models iterate and refine,
+        # so the final block is the most correct.
+        matches = re.findall(r"```python\s*(.*?)```", text, re.DOTALL)
+        if matches:
+            return matches[-1].strip()
         match = re.search(r"(def transform\(.*)", text, re.DOTALL)
         if match:
             return match.group(1).strip()
@@ -339,7 +396,16 @@ class SingleAgent:
 
         transform_fn = namespace.get("transform")
         if transform_fn is None:
-            return None, "No `transform` function found in generated code."
+            # Accept any user-defined callable — models sometimes use a different name
+            user_fns = [
+                v for k, v in namespace.items()
+                if callable(v) and k not in _DSL_NAMESPACE and not k.startswith("_")
+                and k != "__builtins__"
+            ]
+            if user_fns:
+                transform_fn = user_fns[-1]
+            else:
+                return None, "No `transform` function found in generated code."
 
         try:
             with contextlib.redirect_stdout(io.StringIO()):
