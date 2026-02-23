@@ -49,15 +49,14 @@ _DSL_NAMESPACE: dict[str, Any] = {
 _SYSTEM_PROMPT = textwrap.dedent("""
     You are an expert at solving ARC-AGI (Abstraction and Reasoning Corpus) puzzles.
 
-    Each puzzle shows several input→output grid pairs that all share the same hidden
-    transformation rule. Your job is to discover that rule and write a Python function
-    that implements it exactly.
+    Each puzzle shows several input→output grid pairs that share one hidden transformation
+    rule. Your job: discover the rule and write a Python function that implements it exactly.
 
     Grids are 2-D numpy arrays of integers 0-9 representing colours:
       0=black  1=blue  2=red   3=green  4=yellow
       5=grey   6=magenta  7=orange  8=azure  9=maroon
 
-    You have these DSL helpers available in your function (already imported):
+    DSL helpers available inside your function (already imported, no extra imports needed):
       crop(grid, r1, c1, r2, c2)        flip(grid, axis)          rotate(grid, n)
       translate(grid, dr, dc, fill=0)   scale(grid, factor)       tile(grid, n_rows, n_cols)
       recolor(grid, from_color, to_color)
@@ -65,14 +64,23 @@ _SYSTEM_PROMPT = textwrap.dedent("""
       find_objects(grid, background=None) → list of {color, pixels, bbox, subgrid}
       bounding_box(grid, color=None)     crop_to_content(grid)
       mask(grid, mask_grid, fill=0)      overlay(base, top, transparent=0)
-      np  (numpy)
+      np  (numpy is available as np)
 
-    Rules:
-    - Write ONLY the function — no imports, no top-level code.
-    - The function signature must be exactly:  def transform(grid: np.ndarray) -> np.ndarray
-    - Return a new numpy int32 array (never modify the input).
-    - Wrap your code in a ```python ... ``` block.
-    - Before the code block, briefly explain your reasoning (chain of thought).
+    REQUIRED RESPONSE FORMAT — follow these steps in order:
+
+    STEP 1 — OBSERVE: For each training pair, describe in one sentence what changed
+    (e.g. "the 3×3 input is tiled 3 times horizontally and vertically to make a 9×9 output").
+
+    STEP 2 — RULE: State the single generalised rule in plain English.
+
+    STEP 3 — VERIFY: Mentally check the rule holds for every training pair.
+
+    STEP 4 — CODE: Write the function in a ```python ... ``` block.
+
+    Coding rules:
+    - Signature must be exactly:  def transform(grid: np.ndarray) -> np.ndarray
+    - Return a NEW numpy int32 array — never modify the input in place.
+    - No imports, no print statements, no top-level code outside the function.
 """).strip()
 
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
@@ -171,9 +179,13 @@ class SingleAgent:
         best_code: str | None = None
         best_n_correct: int = -1
 
+        # Temperature schedule: greedy on first attempt, increasingly exploratory on retries
+        _temps = [0.0, 0.4, 0.8, 1.0]
+
         for attempt in range(1, self.max_retries + 2):
+            temperature = _temps[min(attempt - 1, len(_temps) - 1)]
             try:
-                response_text = self._call_model(messages)
+                response_text = self._call_model(messages, temperature=temperature)
             except TimeoutError as e:
                 entry = {"attempt": attempt, "error": f"timeout: {e}", "n_correct": 0}
                 log.append(entry)
@@ -370,10 +382,10 @@ class SingleAgent:
     # Model API (backend-agnostic)
     # ------------------------------------------------------------------
 
-    def _call_model(self, messages: list[dict]) -> str:
+    def _call_model(self, messages: list[dict], temperature: float = 0.0) -> str:
         if self.backend == "anthropic":
             return self._call_anthropic(messages)
-        return self._call_ollama(messages)
+        return self._call_ollama(messages, temperature=temperature)
 
     def _call_anthropic(self, messages: list[dict]) -> str:
         response = self.client.messages.create(
@@ -384,7 +396,7 @@ class SingleAgent:
         )
         return response.content[0].text
 
-    def _call_ollama(self, messages: list[dict]) -> str:
+    def _call_ollama(self, messages: list[dict], temperature: float = 0.0) -> str:
         import json
         import urllib.request
 
@@ -393,7 +405,7 @@ class SingleAgent:
             "model": self.model,
             "messages": full_messages,
             "stream": False,
-            "options": {"temperature": 0.6, "num_predict": 16000},
+            "options": {"temperature": temperature, "num_predict": 16000},
         }).encode()
 
         import socket
