@@ -178,6 +178,10 @@ class SingleAgent:
                 entry = {"attempt": attempt, "error": f"timeout: {e}", "n_correct": 0}
                 log.append(entry)
                 break
+            except Exception as e:
+                entry = {"attempt": attempt, "error": f"model_error: {e}", "n_correct": 0}
+                log.append(entry)
+                break
             messages.append({"role": "assistant", "content": response_text})
 
             # Strip chain-of-thought thinking tags before extracting code.
@@ -311,9 +315,13 @@ class SingleAgent:
         return None
 
     def _execute(self, code: str, input_grid: Grid) -> tuple[Grid | None, str | None]:
+        import io
+        import contextlib
+
         namespace = dict(_DSL_NAMESPACE)
         try:
-            exec(code, namespace)  # noqa: S102
+            with contextlib.redirect_stdout(io.StringIO()):
+                exec(code, namespace)  # noqa: S102
         except Exception as e:
             return None, f"Compile error: {type(e).__name__}: {e}"
 
@@ -322,7 +330,8 @@ class SingleAgent:
             return None, "No `transform` function found in generated code."
 
         try:
-            result = transform_fn(input_grid.copy())
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = transform_fn(input_grid.copy())
             if not isinstance(result, np.ndarray):
                 result = np.array(result, dtype=np.int32)
             return result.astype(np.int32), None
@@ -399,8 +408,12 @@ class SingleAgent:
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 result = json.loads(resp.read())
-        except (socket.timeout, urllib.error.URLError) as e:
+        except socket.timeout as e:
             raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, socket.timeout):
+                raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
+            raise
 
         msg = result.get("message", {})
         content = msg.get("content", "")
