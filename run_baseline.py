@@ -101,21 +101,17 @@ def solve_one(task_path: Path, agent: SingleAgent, verbose: bool = True) -> dict
 def save_log(results: list[dict], log_dir: Path) -> Path:
     """Serialise results to a timestamped JSON file inside log_dir.
 
-    Numpy arrays in the log entries are stripped before serialisation.
+    All fields — including the per-attempt 'log' list — are written out.
+    Log entries contain only str/int/bool values so json.dump handles them
+    directly with no pre-processing.
     Returns the path to the written file.
     """
     log_dir.mkdir(exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"baseline_{ts}.json"
 
-    # Drop the per-attempt log list; it may contain Grid objects.
-    serialisable = [
-        {k: v for k, v in r.items() if k != "log"}
-        for r in results
-    ]
-
     with open(log_path, "w") as f:
-        json.dump(serialisable, f, indent=2)
+        json.dump(results, f, indent=2)
 
     return log_path
 

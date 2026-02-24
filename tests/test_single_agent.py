@@ -1010,3 +1010,20 @@ class TestSolve:
         agent.client.messages.create.return_value = _mock_response(response)
         result = agent.solve(simple_task)
         assert result["success"]
+
+    def test_solve_log_is_json_serialisable(self, simple_task):
+        """The 'log' list must be JSON-serialisable so save_log can write it.
+
+        Log entries contain only str/int/bool — no numpy arrays or Grid objects.
+        This test guards against regressions that would re-introduce non-serialisable
+        values and break the debug output.
+        """
+        import json
+        agent = make_agent()
+        agent.client.messages.create.return_value = _mock_response(self._wrong_code())
+        result = agent.solve(simple_task)
+        # Must not raise
+        serialised = json.dumps(result["log"])
+        reloaded = json.loads(serialised)
+        assert isinstance(reloaded, list)
+        assert len(reloaded) == len(result["log"])
