@@ -206,6 +206,11 @@ def bounding_box(grid: Grid, color: int | None = None) -> tuple[int, int, int, i
     # Collapse each axis to find which rows/cols contain a matching cell
     rows = np.any(mask_arr, axis=1)
     cols = np.any(mask_arr, axis=0)
+
+    # Guard: color absent from grid (or all-background grid with no color arg)
+    if not np.any(rows):
+        return 0, 0, 0, 0
+
     r_min, r_max = np.where(rows)[0][[0, -1]]
     c_min, c_max = np.where(cols)[0][[0, -1]]
     return int(r_min), int(c_min), int(r_max), int(c_max)

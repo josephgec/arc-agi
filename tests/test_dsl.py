@@ -424,6 +424,16 @@ class TestBoundingBox:
         assert r_min == 1
         assert c_min == 1
 
+    def test_absent_color_returns_zeros(self):
+        """Requesting the bbox of a color not present must return (0,0,0,0), not crash."""
+        grid = g([0, 1, 0], [1, 0, 1], [0, 1, 0])
+        assert bounding_box(grid, color=9) == (0, 0, 0, 0)
+
+    def test_all_background_returns_zeros(self):
+        """A grid with no non-background cells must return (0,0,0,0), not crash."""
+        grid = g([0, 0], [0, 0])
+        assert bounding_box(grid) == (0, 0, 0, 0)
+
 
 # ---------------------------------------------------------------------------
 # crop_to_content
