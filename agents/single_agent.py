@@ -101,6 +101,10 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 # Temperature values used across retry attempts (greedy first, then exploratory).
 _TEMPERATURE_SCHEDULE = [0.0, 0.4, 0.8, 1.0]
 
+# Hard wall-clock limit for executing generated code.  Kills any runaway
+# infinite loop before it can freeze the parent process.
+_EXECUTION_TIMEOUT = 10.0  # seconds
+
 
 # ---------------------------------------------------------------------------
 # Module-level helper functions (pure, no model I/O)
@@ -150,6 +154,63 @@ def _diff_summary(expected: Grid, predicted: Grid, max_show: int = 12) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Subprocess worker for sandboxed code execution
+# ---------------------------------------------------------------------------
+
+def _subprocess_run(code: str, grid_list: list, out_queue) -> None:
+    """Execute generated code inside a child process and put the result in out_queue.
+
+    Must be a module-level function so it is picklable when multiprocessing
+    uses the 'spawn' start method (default on macOS / Windows).
+
+    Puts exactly one item into out_queue:
+        ("ok",    result_list)   — success; result_list is grid.tolist()
+        ("error", message: str)  — any failure (compile, runtime, missing fn)
+    """
+    import io
+    import contextlib
+    import traceback
+    import numpy as np
+
+    # Rebuild the DSL namespace in this process (required with spawn start method)
+    namespace = dict(_DSL_NAMESPACE)
+
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(code, namespace)  # noqa: S102
+    except Exception as e:
+        out_queue.put(("error", f"Compile error: {type(e).__name__}: {e}"))
+        return
+
+    # Prefer a function literally named "transform"; fall back to any
+    # user-defined callable (models sometimes use different names).
+    transform_fn = namespace.get("transform")
+    if transform_fn is None:
+        user_fns = [
+            v for k, v in namespace.items()
+            if callable(v)
+            and k not in _DSL_NAMESPACE
+            and not k.startswith("_")
+            and k != "__builtins__"
+        ]
+        if user_fns:
+            transform_fn = user_fns[-1]
+        else:
+            out_queue.put(("error", "No `transform` function found in generated code."))
+            return
+
+    input_grid = np.array(grid_list, dtype=np.int32)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = transform_fn(input_grid.copy())
+        if not isinstance(result, np.ndarray):
+            result = np.array(result, dtype=np.int32)
+        out_queue.put(("ok", result.astype(np.int32).tolist()))
+    except Exception as e:
+        out_queue.put(("error", f"Runtime error: {type(e).__name__}: {e}\n{traceback.format_exc()}"))
+
+
+# ---------------------------------------------------------------------------
 # SingleAgent
 # ---------------------------------------------------------------------------
 
@@ -192,6 +253,9 @@ class SingleAgent:
         self.max_retries = max_retries
         self.debug = debug
         self._timeout = timeout
+        # Per-execution wall-clock limit.  Exposed as an instance attribute so
+        # tests can lower it without patching the module-level constant.
+        self._execution_timeout = _EXECUTION_TIMEOUT
 
         if backend == "ollama":
             self.model = model or DEFAULT_OLLAMA_MODEL
@@ -513,54 +577,52 @@ class SingleAgent:
         return None
 
     def _execute(self, code: str, input_grid: Grid) -> tuple[Grid | None, str | None]:
-        """Execute generated code and run the transform function on input_grid.
+        """Execute generated code in a subprocess with a hard timeout.
 
-        The code runs in an isolated namespace seeded with the DSL functions and
-        numpy.  stdout is suppressed to prevent print() calls polluting output.
+        Spawns a child process to run the code so that an infinite loop (or any
+        other runaway computation) cannot freeze the parent.  The child is
+        forcibly killed if it has not finished within self._execution_timeout
+        seconds.
 
-        Returns a (result_grid, error_message) tuple.  Exactly one of the two
-        will be None.
+        The code runs in an isolated namespace seeded with the DSL and numpy.
+        stdout inside the child is suppressed.
+
+        Returns a (result_grid, error_message) tuple — exactly one will be None.
         """
-        import io
-        import contextlib
+        import multiprocessing as mp
 
-        # Reject code that attempts to read from stdin — the grid is passed as
-        # an argument so stdin access indicates a misunderstanding by the model.
+        # Quick guard before paying the subprocess-spawn cost.  stdin access
+        # indicates a model misunderstanding — reject it immediately.
         if "input(" in code or "sys.stdin" in code:
             return None, "Code uses input()/stdin — not allowed; grid is passed as argument."
 
-        namespace = dict(_DSL_NAMESPACE)
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                exec(code, namespace)  # noqa: S102
-        except Exception as e:
-            return None, f"Compile error: {type(e).__name__}: {e}"
+        # Pass the grid as a plain Python list so it is picklable across all
+        # multiprocessing start methods (fork, spawn, forkserver).
+        out_queue: mp.Queue = mp.Queue()
+        proc = mp.Process(
+            target=_subprocess_run,
+            args=(code, input_grid.tolist(), out_queue),
+        )
+        proc.start()
+        proc.join(timeout=self._execution_timeout)
 
-        # Prefer a function literally named "transform"; fall back to any
-        # user-defined callable in the namespace (models sometimes use other names).
-        transform_fn = namespace.get("transform")
-        if transform_fn is None:
-            user_fns = [
-                v for k, v in namespace.items()
-                if callable(v)
-                and k not in _DSL_NAMESPACE
-                and not k.startswith("_")
-                and k != "__builtins__"
-            ]
-            if user_fns:
-                transform_fn = user_fns[-1]
-            else:
-                return None, "No `transform` function found in generated code."
+        if proc.is_alive():
+            # Deadline exceeded — kill the runaway child and report timeout.
+            proc.kill()
+            proc.join()
+            return None, (
+                f"Execution timed out after {self._execution_timeout}s "
+                "(infinite loop or excessive computation)"
+            )
 
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                # Pass a copy so that in-place mutations don't affect the original
-                result = transform_fn(input_grid.copy())
-            if not isinstance(result, np.ndarray):
-                result = np.array(result, dtype=np.int32)
-            return result.astype(np.int32), None
-        except Exception as e:
-            return None, f"Runtime error: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+        if out_queue.empty():
+            # Process exited without writing to the queue (e.g. segfault / OOM).
+            return None, f"Execution process exited unexpectedly (exit code {proc.exitcode})"
+
+        status, value = out_queue.get()
+        if status == "ok":
+            return np.array(value, dtype=np.int32), None
+        return None, value
 
     def _evaluate_test(self, code: str, test_pair: dict) -> bool:
         """Evaluate the best code against the held-out test pair's ground truth.

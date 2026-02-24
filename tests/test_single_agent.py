@@ -694,6 +694,22 @@ class TestExecute:
         assert output is None
         assert error is not None
 
+    def test_infinite_loop_killed_by_timeout(self):
+        """An infinite loop must be killed within the execution timeout."""
+        agent = make_agent()
+        agent._execution_timeout = 2.0  # short but not flaky
+        code = "def transform(grid):\n    while True: pass"
+        output, error = agent._execute(code, self._g())
+        assert output is None
+        assert error is not None
+        assert "timed out" in error.lower() or "timeout" in error.lower()
+
+    def test_execution_timeout_attribute_set(self):
+        """_execution_timeout must be set from the module-level constant."""
+        from agents.single_agent import _EXECUTION_TIMEOUT
+        agent = make_agent()
+        assert agent._execution_timeout == _EXECUTION_TIMEOUT
+
 
 # ---------------------------------------------------------------------------
 # _evaluate_test
