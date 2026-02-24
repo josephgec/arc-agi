@@ -95,7 +95,7 @@ _SYSTEM_PROMPT = textwrap.dedent("""
 # Backend connection settings
 OLLAMA_BASE_URL   = "http://localhost:11434/v1"
 OLLAMA_CHAT_URL   = "http://localhost:11434/api/chat"
-DEFAULT_OLLAMA_MODEL    = "deepseek-r1:8b"
+DEFAULT_OLLAMA_MODEL    = "deepseek-r1:32b"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
 # Temperature values used across retry attempts (greedy first, then exploratory).
@@ -135,8 +135,10 @@ def _diff_summary(expected: Grid, predicted: Grid, max_show: int = 12) -> str:
         r, c = it.multi_index
         ev, pv = int(it[0]), int(it[1])
         if ev != pv:
+            ev_name = COLOR_NAMES.get(ev, "unknown")
+            pv_name = COLOR_NAMES.get(pv, "unknown")
             diffs.append(
-                f"  ({r},{c}) expected {ev} ({COLOR_NAMES[ev]}) got {pv} ({COLOR_NAMES[pv]})"
+                f"  ({r},{c}) expected {ev} ({ev_name}) got {pv} ({pv_name})"
             )
         it.iternext()
 
@@ -211,12 +213,20 @@ class SingleAgent:
         Runs up to max_retries + 1 model calls.  The temperature rises each
         attempt to encourage more diverse completions on retries.
 
+        The self-correction loop exclusively uses training pairs, which mirrors
+        real ARC evaluation (test ground truth is not available at solve time).
+        When a test ground truth *is* present in the task (as it is in the ARC
+        training split), the best code is additionally evaluated against it so
+        that callers can report honest held-out accuracy.
+
         Returns:
             {
-                'success':    bool      — True if all training pairs passed
-                'code':       str|None  — best code found (even if not fully correct)
-                'n_attempts': int       — number of model calls made
-                'log':        list[dict]— per-attempt details
+                'success':      bool       — True if all training pairs passed
+                'test_correct': bool|None  — True/False if test ground truth is
+                                             present; None when it is absent
+                'code':         str|None   — best code found (even if not fully correct)
+                'n_attempts':   int        — number of model calls made
+                'log':          list[dict] — per-attempt details
             }
         """
         log: list[dict] = []
@@ -226,6 +236,13 @@ class SingleAgent:
 
         best_code: str | None = None
         best_n_correct: int = -1
+
+        # Determine whether we can honestly evaluate on the test pair.
+        # In the ARC training split, test outputs are present; in the real
+        # evaluation split they are not.  We never use this during self-correction
+        # (that would be data leakage); it is only checked at the very end.
+        test_pair = task.get("test", [{}])[0]
+        has_test_ground_truth = "output" in test_pair
 
         for attempt in range(1, self.max_retries + 2):
             temperature = _TEMPERATURE_SCHEDULE[min(attempt - 1, len(_TEMPERATURE_SCHEDULE) - 1)]
@@ -282,10 +299,11 @@ class SingleAgent:
             # Success: every training pair is correct
             if eval_result["all_correct"]:
                 return {
-                    "success":    True,
-                    "code":       best_code,
-                    "n_attempts": attempt,
-                    "log":        log,
+                    "success":      True,
+                    "test_correct": self._evaluate_test(best_code, test_pair) if has_test_ground_truth else None,
+                    "code":         best_code,
+                    "n_attempts":   attempt,
+                    "log":          log,
                 }
 
             # Not yet correct — add error feedback for the next attempt
@@ -296,10 +314,11 @@ class SingleAgent:
                 })
 
         return {
-            "success":    False,
-            "code":       best_code,
-            "n_attempts": self.max_retries + 1,
-            "log":        log,
+            "success":      False,
+            "test_correct": self._evaluate_test(best_code, test_pair) if has_test_ground_truth and best_code else None,
+            "code":         best_code,
+            "n_attempts":   self.max_retries + 1,
+            "log":          log,
         }
 
     def predict(self, task: dict) -> Grid | None:
@@ -542,6 +561,21 @@ class SingleAgent:
             return result.astype(np.int32), None
         except Exception as e:
             return None, f"Runtime error: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+
+    def _evaluate_test(self, code: str, test_pair: dict) -> bool:
+        """Evaluate the best code against the held-out test pair's ground truth.
+
+        This is the honest accuracy metric.  It is called only after the
+        self-correction loop has finished — never during it — so the test output
+        is never exposed to the model.
+
+        Returns True if the predicted output exactly matches the ground truth,
+        False on any mismatch, wrong shape, or runtime error.
+        """
+        output, error = self._execute(code, test_pair["input"])
+        if error or output is None:
+            return False
+        return grids_equal(output, test_pair["output"])
 
     def _evaluate_code(self, code: str, task: dict) -> dict:
         """Run the generated code against all training pairs and collect results.

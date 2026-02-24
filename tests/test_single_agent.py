@@ -602,6 +602,108 @@ class TestExecute:
 
 
 # ---------------------------------------------------------------------------
+# _evaluate_test
+# ---------------------------------------------------------------------------
+
+class TestEvaluateTest:
+    """Tests for the held-out test evaluation — the honest accuracy metric."""
+
+    def _task_with_test_output(self, correct: bool):
+        """Build a simple task whose test pair has a ground-truth output.
+
+        The rule is recolor 1→2.  `correct=True` means the test output
+        expects that transformation; `correct=False` expects the wrong answer.
+        """
+        test_input  = np.array([[0, 1, 1]], dtype=np.int32)
+        test_output = np.array([[0, 2, 2]], dtype=np.int32) if correct else np.array([[0, 9, 9]], dtype=np.int32)
+        return {
+            "train": [
+                {
+                    "input":  np.array([[1]], dtype=np.int32),
+                    "output": np.array([[2]], dtype=np.int32),
+                }
+            ],
+            "test": [{"input": test_input, "output": test_output}],
+        }
+
+    def test_correct_prediction_returns_true(self):
+        agent = make_agent()
+        code = "def transform(grid):\n    return recolor(grid, 1, 2)"
+        test_pair = self._task_with_test_output(correct=True)["test"][0]
+        assert agent._evaluate_test(code, test_pair) is True
+
+    def test_wrong_prediction_returns_false(self):
+        agent = make_agent()
+        code = "def transform(grid):\n    return grid.copy()"  # identity — wrong
+        test_pair = self._task_with_test_output(correct=True)["test"][0]
+        assert agent._evaluate_test(code, test_pair) is False
+
+    def test_runtime_error_returns_false(self):
+        agent = make_agent()
+        code = "def transform(grid):\n    raise RuntimeError('crash')"
+        test_pair = self._task_with_test_output(correct=True)["test"][0]
+        assert agent._evaluate_test(code, test_pair) is False
+
+    def test_solve_sets_test_correct_true_when_code_is_right(self):
+        """solve() must set test_correct=True when best code passes the test pair."""
+        agent = make_agent()
+        task = self._task_with_test_output(correct=True)
+        agent.client.messages.create.return_value = _mock_response(
+            "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
+        )
+        result = agent.solve(task)
+        assert result["success"] is True
+        assert result["test_correct"] is True
+
+    def test_solve_sets_test_correct_false_when_code_overfits(self):
+        """An overfit function passes training but fails the test pair."""
+        agent = make_agent()
+        # The task has one training pair: [[1]] → [[2]]
+        # The overfit function hardcodes that exact input and returns the wrong
+        # answer for anything else — including the test input [[0, 1, 1]].
+        task = self._task_with_test_output(correct=True)
+        overfit_code = (
+            "```python\n"
+            "def transform(grid):\n"
+            "    import numpy as np\n"
+            "    if np.array_equal(grid, [[1]]):\n"
+            "        return np.array([[2]], dtype=np.int32)\n"
+            "    return grid.copy()  # wrong for all other inputs\n"
+            "```"
+        )
+        agent.client.messages.create.return_value = _mock_response(overfit_code)
+        result = agent.solve(task)
+        # Training passes (the hardcoded answer matches), but test fails
+        assert result["success"] is True
+        assert result["test_correct"] is False
+
+    def test_solve_returns_test_correct_none_when_no_ground_truth(self, simple_task):
+        """simple_task has no test output — test_correct must be None."""
+        agent = make_agent()
+        agent.client.messages.create.return_value = _mock_response(
+            "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
+        )
+        result = agent.solve(simple_task)
+        assert result["test_correct"] is None
+
+    def test_solve_sets_test_correct_on_failed_solve_too(self):
+        """Even when success=False, test_correct reflects the best code's result."""
+        agent = make_agent()
+        task = self._task_with_test_output(correct=True)
+        # Correct code for the test but deliberately wrong for training
+        # (training pair expects [[2]] but we return [[1]])
+        agent.client.messages.create.return_value = _mock_response(
+            "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
+        )
+        # Force all training pairs to fail by making training output something else
+        task["train"][0]["output"] = np.array([[9]], dtype=np.int32)
+        result = agent.solve(task)
+        assert result["success"] is False
+        # The best code still produces the right answer on the test pair
+        assert result["test_correct"] is True
+
+
+# ---------------------------------------------------------------------------
 # _evaluate_code
 # ---------------------------------------------------------------------------
 
@@ -718,6 +820,13 @@ class TestSolve:
         ]
         result = agent.solve(simple_task)
         assert result["success"]
+
+    def test_solve_result_always_has_test_correct_key(self, simple_task):
+        """test_correct must always be present in the result dict."""
+        agent = make_agent()
+        agent.client.messages.create.return_value = _mock_response(self._correct_code())
+        result = agent.solve(simple_task)
+        assert "test_correct" in result
 
     def test_solve_returns_log(self, simple_task):
         agent = make_agent()

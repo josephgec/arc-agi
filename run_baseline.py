@@ -13,6 +13,21 @@ Usage:
 
   # Use a different local model:
   python run_baseline.py --task data/data/training/007bbfb7.json --model qwen2.5-coder:32b
+
+Accuracy reporting
+------------------
+Two metrics are reported:
+
+  train_solved  — tasks where the generated function passes *all training pairs*.
+                  This is what drives self-correction and is an optimistic upper
+                  bound; a function that hardcodes the training examples would
+                  score 100% here.
+
+  test_correct  — tasks where the generated function produces the exact right
+                  answer on the held-out test input (ground truth taken from the
+                  task JSON).  This is the honest accuracy metric.  Only
+                  available when running against the training split (which
+                  includes test ground truth); None otherwise.
 """
 from __future__ import annotations
 
@@ -44,6 +59,7 @@ def solve_one(task_path: Path, agent: SingleAgent, verbose: bool = True) -> dict
 
     Returns:
         The result dict from agent.solve() augmented with 'task_id' and 'elapsed_s'.
+        Includes 'test_correct' (bool | None) from solve().
     """
     task_id = task_path.stem
     task = load_task(task_path)
@@ -57,17 +73,22 @@ def solve_one(task_path: Path, agent: SingleAgent, verbose: bool = True) -> dict
     result = agent.solve(task, task_id=task_id)
     elapsed = time.time() - t0
 
-    result["task_id"] = task_id
+    result["task_id"]   = task_id
     result["elapsed_s"] = round(elapsed, 2)
 
     if verbose:
-        status = "SOLVED" if result["success"] else "FAILED"
-        print(f"\n[{status}] {task_id}  ({result['n_attempts']} attempt(s), {elapsed:.1f}s)")
+        train_status = "TRAIN-PASS" if result["success"] else "TRAIN-FAIL"
+        test_status  = (
+            "TEST-CORRECT" if result["test_correct"] is True
+            else "TEST-WRONG" if result["test_correct"] is False
+            else "TEST-N/A"
+        )
+        print(f"\n[{train_status}] [{test_status}] {task_id}  ({result['n_attempts']} attempt(s), {elapsed:.1f}s)")
         for i, entry in enumerate(result["log"]):
             correct = entry.get("n_correct", 0)
-            total = entry.get("n_total", "?")
-            err = entry.get("error", "")
-            print(f"  Attempt {i + 1}: {correct}/{total} pairs correct  {err or ''}")
+            total   = entry.get("n_total", "?")
+            err     = entry.get("error", "")
+            print(f"  Attempt {i + 1}: {correct}/{total} training pairs correct  {err or ''}")
         if result["code"] and result["success"]:
             print("\nWinning code:")
             print("-" * 40)
@@ -144,15 +165,35 @@ def main() -> None:
             f"(backend={args.backend}, model={model_label}, retries={args.retries})"
         )
 
-        n_solved = 0
+        n_train_solved  = 0  # all training pairs correct (optimistic / gameable)
+        n_test_correct  = 0  # held-out test pair correct (honest accuracy)
+        n_test_available = 0  # tasks that have test ground truth
+
         for i, path in enumerate(task_files, 1):
             result = solve_one(path, agent, verbose=not args.quiet)
             results.append(result)
-            n_solved += int(result["success"])
-            pct = n_solved / i * 100
-            print(f"Progress: {i}/{len(task_files)}  solved={n_solved} ({pct:.1f}%)")
 
-        print(f"\nFinal: solved {n_solved}/{len(task_files)} ({n_solved / len(task_files) * 100:.1f}%)")
+            n_train_solved += int(result["success"])
+
+            if result["test_correct"] is not None:
+                n_test_available += 1
+                n_test_correct   += int(result["test_correct"])
+
+            # Progress line shows both metrics so over-fitting is immediately visible
+            train_pct = n_train_solved / i * 100
+            test_str  = (
+                f"  test_correct={n_test_correct}/{n_test_available} ({n_test_correct / n_test_available * 100:.1f}%)"
+                if n_test_available else ""
+            )
+            print(f"Progress: {i}/{len(task_files)}  train_solved={n_train_solved} ({train_pct:.1f}%){test_str}")
+
+        n = len(task_files)
+        print(f"\n{'=' * 60}")
+        print(f"Train-solved (optimistic): {n_train_solved}/{n}  ({n_train_solved / n * 100:.1f}%)")
+        if n_test_available:
+            print(f"Test-correct  (honest):    {n_test_correct}/{n_test_available}  ({n_test_correct / n_test_available * 100:.1f}%)")
+        else:
+            print("Test-correct  (honest):    N/A (no test ground truth in this split)")
 
     log_path = save_log(results, Path("logs"))
     print(f"\nLog saved to {log_path}")
