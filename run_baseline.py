@@ -95,7 +95,7 @@ def main() -> None:
     parser.add_argument("--model", default=None,
                         help="Model name (default: deepseek-r1:70b for ollama, claude-sonnet-4-6 for anthropic)")
     parser.add_argument("--retries", type=int, default=3, help="Max self-correction retries")
-    parser.add_argument("--timeout", type=float, default=300.0, help="Seconds to wait per model call (ollama only)")
+    parser.add_argument("--timeout", type=float, default=600.0, help="Seconds to wait per model call (ollama only)")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-task details")
     parser.add_argument("--debug", action="store_true", help="Print raw model responses")
     args = parser.parse_args()
