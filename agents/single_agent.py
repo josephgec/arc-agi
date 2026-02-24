@@ -634,12 +634,19 @@ class SingleAgent:
         """Send a streaming chat request to the local Ollama server.
 
         Streams the NDJSON response line-by-line so we can:
-          - exit early once a complete code block is detected (saves time), and
+          - exit early once a complete code block is detected *outside* any
+            <think> block (saves time without cutting off the final answer), and
           - recover partial results if the wall-clock deadline is reached.
 
         Thinking tokens (from extended-thinking models like deepseek-r1) are
         collected separately and wrapped in <think>…</think> tags so that
         _strip_thinking() can remove them uniformly.
+
+        Early-exit is deliberately suppressed while a <think> block is still
+        open: reasoning models write draft code inside <think> before emitting
+        their final answer; breaking there would leave the closing </think>
+        tag missing, causing _strip_thinking() to fail and the agent to execute
+        the draft code instead of the final one.
 
         Raises TimeoutError if the server never responds at all.
         """
@@ -690,15 +697,29 @@ class SingleAgent:
                     if chunk.get("done"):
                         break  # server signalled completion
 
-                    # Early-exit: a complete code block is already present —
-                    # no need to wait for reasoning or follow-up prose.
+                    # Early-exit: a complete code block is present *outside*
+                    # any <think> block.
+                    #
+                    # Reasoning models (deepseek-r1, qwen3) routinely write
+                    # draft code inside <think>…</think> before producing their
+                    # final answer.  If we break on the first code block we see,
+                    # </think> may never arrive, _strip_thinking() won't match,
+                    # and we execute the unrefined draft instead of the final
+                    # answer.  The fix: strip completed <think> blocks first,
+                    # then only exit if the remaining content has a code block
+                    # AND no <think> is still open.
                     content_so_far = "".join(content_parts)
+                    content_outside_think = re.sub(
+                        r"<think>.*?</think>", "", content_so_far, flags=re.DOTALL
+                    )
+                    think_still_open = "<think>" in content_outside_think
                     if (
-                        content_so_far.count("```") >= 2
-                        and "def " in content_so_far
+                        not think_still_open
+                        and content_outside_think.count("```") >= 2
+                        and "def " in content_outside_think
                         and re.search(
                             r"```(?:python)?\s.*?```",
-                            content_so_far,
+                            content_outside_think,
                             re.DOTALL | re.IGNORECASE,
                         )
                     ):

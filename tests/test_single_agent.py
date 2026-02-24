@@ -420,6 +420,32 @@ class TestBlockAnalysis:
 # _call_ollama — streaming Ollama API (urllib mocked)
 # ---------------------------------------------------------------------------
 
+def _ollama_chunks(*content_pieces: str, thinking: str = "") -> MagicMock:
+    """Build a streaming mock that yields one chunk per content piece.
+
+    Unlike _ollama_ctx (which puts everything in one or two chunks), this
+    helper lets tests send content incrementally — essential for verifying
+    early-exit behaviour mid-stream.
+    """
+    lines: list[bytes] = []
+    if thinking:
+        lines.append(
+            json.dumps({"message": {"content": "", "thinking": thinking}, "done": False}).encode() + b"\n"
+        )
+    for piece in content_pieces:
+        lines.append(
+            json.dumps({"message": {"content": piece, "thinking": ""}, "done": False}).encode() + b"\n"
+        )
+    lines.append(
+        json.dumps({"message": {"content": "", "thinking": ""}, "done": True}).encode() + b"\n"
+    )
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=cm)
+    cm.__exit__  = MagicMock(return_value=False)
+    cm.__iter__  = lambda self: iter(lines)
+    return cm
+
+
 class TestCallOllama:
     def _agent(self) -> SingleAgent:
         return SingleAgent(backend="ollama", timeout=10.0)
@@ -489,6 +515,74 @@ class TestCallOllama:
 
         # Should return partial thinking rather than raise TimeoutError
         assert "partial thinking" in result
+
+    # ------------------------------------------------------------------
+    # Early-exit / <think> interaction tests
+    # ------------------------------------------------------------------
+
+    def test_no_early_exit_while_think_block_open(self):
+        """Draft code inside an unclosed <think> block must not trigger early-exit.
+
+        The stream must continue so that </think> arrives and the final answer
+        (after the closing tag) is captured.
+        """
+        agent = self._agent()
+        draft  = "<think>\n```python\ndef transform(grid):\n    return grid * 0\n```\nLet me reconsider...\n"
+        final  = "</think>\n```python\ndef transform(grid):\n    return grid.copy()\n```"
+
+        with patch("urllib.request.urlopen", return_value=_ollama_chunks(draft, final)):
+            result = agent._call_ollama([{"role": "user", "content": "hi"}])
+
+        # The full content (both pieces) must be returned
+        assert "return grid * 0"   in result   # draft present in raw output
+        assert "return grid.copy()" in result  # final answer also present
+
+    def test_strip_thinking_removes_draft_leaving_final(self):
+        """After _call_ollama returns, _strip_thinking must expose only the final code.
+
+        This is the end-to-end fix: draft inside <think> is stripped; only the
+        real answer after </think> is available for code extraction.
+        """
+        agent = self._agent()
+        draft  = "<think>\n```python\ndef transform(grid):\n    return grid * 0\n```\n</think>\n"
+        final  = "```python\ndef transform(grid):\n    return grid.copy()\n```"
+
+        with patch("urllib.request.urlopen", return_value=_ollama_chunks(draft, final)):
+            raw = agent._call_ollama([{"role": "user", "content": "hi"}])
+
+        cleaned = _strip_thinking(raw)
+        assert "return grid * 0"    not in cleaned  # draft stripped
+        assert "return grid.copy()" in cleaned       # final answer kept
+
+    def test_early_exit_fires_on_final_code_after_closed_think(self):
+        """Early-exit IS allowed once </think> has closed and final code is complete."""
+        agent = self._agent()
+        thinking_and_final = (
+            "<think>some reasoning</think>\n"
+            "```python\ndef transform(grid):\n    return grid.copy()\n```"
+        )
+        trailing_prose = "Here is why this works..."  # should never arrive
+
+        with patch("urllib.request.urlopen",
+                   return_value=_ollama_chunks(thinking_and_final, trailing_prose)):
+            result = agent._call_ollama([{"role": "user", "content": "hi"}])
+
+        # Early-exit fired before trailing_prose was consumed
+        assert "trailing_prose" not in result
+        assert "return grid.copy()" in result
+
+    def test_early_exit_fires_normally_when_no_think_tags(self):
+        """Without any <think> tags, early-exit should still work as before."""
+        agent = self._agent()
+        code_chunk    = "```python\ndef transform(grid):\n    return grid.copy()\n```"
+        trailing_text = " extra text that should be cut off"
+
+        with patch("urllib.request.urlopen",
+                   return_value=_ollama_chunks(code_chunk, trailing_text)):
+            result = agent._call_ollama([{"role": "user", "content": "hi"}])
+
+        assert "return grid.copy()" in result
+        assert "extra text" not in result
 
 
 # ---------------------------------------------------------------------------
