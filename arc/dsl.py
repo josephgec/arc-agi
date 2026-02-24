@@ -41,12 +41,12 @@ def translate(grid: Grid, dr: int, dc: int, fill: int = 0) -> Grid:
     # Compute the source and destination row ranges for the copy.
     # If dr > 0 we shift down: source starts at row 0, destination at row dr.
     # If dr < 0 we shift up:   source starts at row -dr, destination at row 0.
-    src_r = max(0, -dr), min(rows, rows - dr)
-    dst_r = max(0, dr),  min(rows, rows + dr)
+    src_r = max(0, -dr), max(0, min(rows, rows - dr))
+    dst_r = max(0,  dr), max(0, min(rows, rows + dr))
 
     # Same logic for columns.
-    src_c = max(0, -dc), min(cols, cols - dc)
-    dst_c = max(0, dc),  min(cols, cols + dc)
+    src_c = max(0, -dc), max(0, min(cols, cols - dc))
+    dst_c = max(0,  dc), max(0, min(cols, cols + dc))
 
     result[dst_r[0]:dst_r[1], dst_c[0]:dst_c[1]] = grid[src_r[0]:src_r[1], src_c[0]:src_c[1]]
     return result

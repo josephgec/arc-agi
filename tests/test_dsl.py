@@ -161,6 +161,35 @@ class TestTranslate:
         result = translate(grid, 5, 0)
         np.testing.assert_array_equal(result, np.zeros_like(grid))
 
+    def test_shift_past_bottom_in_crash_zone(self):
+        """dr in (rows, 2*rows) triggers negative slice end — must not crash.
+
+        For a 2×2 grid with dr=3: rows - dr = -1, so grid[0:-1] returns one
+        row.  Without the max(0, …) clamp the assignment into the empty
+        destination slice raises ValueError.
+        """
+        grid = g([1, 2], [3, 4])
+        result = translate(grid, 3, 0)  # 2 < 3 < 4 → crash zone
+        np.testing.assert_array_equal(result, np.zeros_like(grid))
+
+    def test_shift_past_top_in_crash_zone(self):
+        """Negative dr in the crash zone (large upward shift) must not crash."""
+        grid = g([1, 2], [3, 4])
+        result = translate(grid, -3, 0)
+        np.testing.assert_array_equal(result, np.zeros_like(grid))
+
+    def test_shift_past_right_in_crash_zone(self):
+        """dc in (cols, 2*cols) must not crash."""
+        grid = g([1, 2], [3, 4])
+        result = translate(grid, 0, 3)
+        np.testing.assert_array_equal(result, np.zeros_like(grid))
+
+    def test_shift_past_left_in_crash_zone(self):
+        """Large negative dc in the crash zone must not crash."""
+        grid = g([1, 2], [3, 4])
+        result = translate(grid, 0, -3)
+        np.testing.assert_array_equal(result, np.zeros_like(grid))
+
 
 # ---------------------------------------------------------------------------
 # scale
