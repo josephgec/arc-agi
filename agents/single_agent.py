@@ -9,7 +9,7 @@ Solving flow per task:
   6. Repeat up to max_retries times with increasing temperature for diversity.
 
 Supported backends:
-  - "ollama"    : local Ollama server (free, default model: deepseek-r1:8b)
+  - "ollama"    : local Ollama server (free, default model: deepseek-r1:32b)
   - "anthropic" : Anthropic API (requires credits, default model: claude-sonnet-4-6)
 """
 from __future__ import annotations

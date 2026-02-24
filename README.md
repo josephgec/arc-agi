@@ -73,7 +73,7 @@ echo "ANTHROPIC_API_KEY=sk-..." > .env
 For the Ollama backend, install [Ollama](https://ollama.com/) and pull a model:
 
 ```bash
-ollama pull deepseek-r1:8b
+ollama pull deepseek-r1:32b
 ```
 
 ## Usage
@@ -109,7 +109,14 @@ python run_baseline.py --task data/data/training/007bbfb7.json --retries 5 --deb
 | `--quiet` | off | Suppress per-task output |
 | `--debug` | off | Print raw model responses |
 
-Results are saved as JSON under `logs/`.
+Results are saved as JSON under `logs/`, including the per-attempt code and error traces for every task.
+
+Two accuracy metrics are reported:
+
+| Metric | Description |
+|--------|-------------|
+| `train_solved` | Tasks where the generated function passes **all training pairs** — an optimistic upper bound (a function that hardcodes the training examples would score 100%). |
+| `test_correct` | Tasks where the function produces the exact right answer on the **held-out test input** — the honest accuracy metric. Only available for the training split (which includes test ground truth). |
 
 ## Implementation Details
 
@@ -139,7 +146,7 @@ To give the model a useful vocabulary, every generated function runs inside a na
 
 **Code extraction** — Model responses are searched for fenced `` ```python `` blocks. The *last* syntactically-valid block containing a `def` is used (reasoning models often draft multiple versions and refine toward the end). If trailing prose corrupts the block, it is trimmed line-by-line via AST validation. Blocks containing no function definition (e.g. grid literals) are rejected. A bare `def` outside any fence is used as a last resort.
 
-**Execution sandbox** — Generated code runs under `exec()` in an isolated namespace seeded with the DSL and numpy. `stdout` is suppressed. Code that references `input()` or `sys.stdin` is rejected before execution. If the model names its function something other than `transform`, the last user-defined callable in the namespace is used as a fallback.
+**Execution sandbox** — Generated code runs in a child process spawned via `multiprocessing.Process`, isolated from the parent. The child is forcibly killed if it has not finished within 10 seconds, preventing infinite loops from hanging the solver. Inside the child, code runs under `exec()` in a namespace seeded with the DSL and numpy; `stdout` is suppressed. Code that references `input()` or `sys.stdin` is rejected before the subprocess is even spawned. If the model names its function something other than `transform`, the last user-defined callable in the namespace is used as a fallback.
 
 **Self-correction loop** — On each failed attempt, the agent sends back a message listing which pairs were wrong, the full expected and predicted grids, and a cell-level diff (coordinates + colour names). The temperature schedule is `[0.0, 0.4, 0.8, 1.0]` — greedy on the first try, increasingly random on retries.
 
