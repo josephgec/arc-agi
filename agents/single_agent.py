@@ -570,10 +570,15 @@ class SingleAgent:
                         return trimmed
             return None  # no valid block found among all fenced blocks
 
-        # No fenced blocks at all — try to find a bare function definition
-        match = re.search(r"(def \w+\(.*)", text, re.DOTALL)
+        # No fenced blocks at all — try to find a bare function definition.
+        # re.DOTALL is intentionally omitted: without it (.*) stops at the
+        # first newline, so we only capture the `def` signature line rather
+        # than greedily consuming all subsequent prose into the snippet.
+        # _truncate_to_valid_function then trims any trailing non-Python lines.
+        match = re.search(r"(def \w+\(.*)", text)
         if match:
-            return match.group(1).strip()
+            candidate = text[match.start():].strip()
+            return self._truncate_to_valid_function(candidate)
         return None
 
     def _execute(self, code: str, input_grid: Grid) -> tuple[Grid | None, str | None]:

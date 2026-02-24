@@ -257,6 +257,25 @@ class TestExtractCode:
         assert code is not None
         assert "def transform" in code
 
+    def test_bare_def_fallback_strips_trailing_prose(self):
+        """Prose after a bare def must be trimmed so exec() does not see it.
+
+        The old fallback used re.DOTALL which captured all trailing text into
+        the snippet, causing a SyntaxError on the English sentences.
+        """
+        agent = make_agent()
+        text = (
+            "def transform(grid):\n"
+            "    return grid.copy()\n"
+            "\n"
+            "This works because we simply copy the grid wholesale.\n"
+            "Hope that helps!"
+        )
+        code = agent._extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+        assert "Hope that helps" not in code
+
     def test_returns_none_when_no_code(self):
         agent = make_agent()
         assert agent._extract_code("No code here.") is None
