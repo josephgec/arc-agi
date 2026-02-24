@@ -182,20 +182,26 @@ class TestUniqueColors:
 # ---------------------------------------------------------------------------
 
 class TestBackgroundColor:
-    def test_most_frequent_is_background(self):
+    def test_zero_always_background_when_present(self):
+        """0 is returned whenever it appears, even if outnumbered by another colour."""
+        g = np.array([[1, 1, 1], [1, 0, 1]], dtype=np.int32)  # 1 appears 5×, 0 once
+        assert background_color(g) == 0
+
+    def test_zero_present_is_background_regardless_of_frequency(self):
         g = np.array([[0, 0, 0], [0, 1, 0]], dtype=np.int32)
         assert background_color(g) == 0
 
-    def test_non_zero_background(self):
+    def test_non_zero_background_when_no_zeros(self):
+        """Falls back to most-frequent when 0 is absent."""
         g = np.array([[7, 7, 7], [7, 1, 7]], dtype=np.int32)
         assert background_color(g) == 7
 
-    def test_tie_picks_first(self):
-        """numpy argmax picks the first maximum on a tie — just verify a valid colour."""
-        g = np.array([[0, 1]], dtype=np.int32)
-        result = background_color(g)
-        assert result in [0, 1]
+    def test_zero_wins_over_more_frequent_color(self):
+        """0 must win even when another colour covers the majority of the grid."""
+        g = np.zeros((5, 5), dtype=np.int32)
+        g[1:4, 1:4] = 2  # 2 covers 9 cells, 0 covers 16 — but still, 0 wins
+        assert background_color(g) == 0
 
-    def test_all_same(self):
+    def test_all_same_no_zero(self):
         g = np.full((3, 3), 5, dtype=np.int32)
         assert background_color(g) == 5

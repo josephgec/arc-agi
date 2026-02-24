@@ -78,6 +78,13 @@ def unique_colors(grid: Grid) -> list[int]:
 
 
 def background_color(grid: Grid) -> int:
-    """Return the most-frequent colour value, assumed to be the background."""
+    """Return the background colour of a grid.
+
+    0 (black) is the universal ARC canvas colour and is always treated as
+    the background when present, regardless of frequency.  Only falls back
+    to the most-frequent colour for the rare grids that contain no zeros.
+    """
+    if 0 in grid:
+        return 0
     values, counts = np.unique(grid, return_counts=True)
     return int(values[np.argmax(counts)])
