@@ -6,7 +6,6 @@ All operations are pure — they return a new array and never mutate the input.
 from __future__ import annotations
 
 import numpy as np
-from scipy import ndimage
 from .grid import Grid, background_color
 
 
