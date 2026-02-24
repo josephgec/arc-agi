@@ -1,4 +1,8 @@
-"""Evaluation harness for ARC-AGI tasks."""
+"""Evaluation harness for ARC-AGI tasks.
+
+Provides utilities for running a transform function against task training pairs
+and aggregating correctness metrics across a directory of task files.
+"""
 from __future__ import annotations
 
 import json
@@ -15,12 +19,17 @@ TransformFn = Callable[[Grid], Grid]
 def evaluate_task(task: dict, transform_fn: TransformFn) -> dict:
     """Apply transform_fn to every training pair and return per-pair results.
 
+    Exceptions raised by transform_fn are caught and recorded as failures so
+    that a single bad pair does not abort the whole evaluation.
+
     Returns:
         {
-            'pairs': [{'correct': bool, 'predicted': Grid, 'expected': Grid, 'error': str|None}],
-            'all_correct': bool,
-            'n_correct': int,
-            'n_total': int,
+            'pairs':       list of per-pair result dicts
+                           {'correct': bool, 'predicted': Grid,
+                            'expected': Grid, 'error': str | None}
+            'all_correct': True only if every pair is correct
+            'n_correct':   number of correct pairs
+            'n_total':     total number of pairs
         }
     """
     pairs = []
@@ -53,7 +62,11 @@ def evaluate_task(task: dict, transform_fn: TransformFn) -> dict:
 
 
 def evaluate_task_file(path: str | Path, transform_fn: TransformFn) -> dict:
-    """Load a task file and evaluate it."""
+    """Load a task JSON file and evaluate it with transform_fn.
+
+    The returned dict is the same as evaluate_task() with an added 'task_id'
+    key set to the file stem (e.g. '007bbfb7').
+    """
     task = load_task(path)
     result = evaluate_task(task, transform_fn)
     result["task_id"] = Path(path).stem
@@ -66,21 +79,22 @@ def score_all(
     limit: int | None = None,
     verbose: bool = True,
 ) -> dict:
-    """Score transform_fn against all tasks in a directory.
+    """Score transform_fn against every task file in a directory.
 
     Args:
-        tasks_dir: directory containing .json task files
-        transform_fn: function Grid -> Grid
-        limit: only evaluate the first N tasks (useful for quick smoke-tests)
-        verbose: print per-task results
+        tasks_dir:    Directory containing .json task files.
+        transform_fn: Function Grid → Grid to evaluate.
+        limit:        If set, only evaluate the first N tasks (useful for
+                      quick smoke-tests without running the full suite).
+        verbose:      Print a one-line result per task plus a final summary.
 
     Returns:
         {
-            'n_tasks': int,
-            'n_solved': int,          # tasks where all pairs correct
-            'accuracy': float,        # n_solved / n_tasks
-            'pair_accuracy': float,   # correct pairs / total pairs
-            'results': list[dict],
+            'n_tasks':       int   — total tasks evaluated
+            'n_solved':      int   — tasks where all pairs were correct
+            'accuracy':      float — n_solved / n_tasks
+            'pair_accuracy': float — correct pairs / total pairs across all tasks
+            'results':       list[dict] — per-task evaluate_task_file results
         }
     """
     tasks_dir = Path(tasks_dir)
@@ -124,7 +138,7 @@ def score_all(
 
 
 def print_errors(result: dict) -> None:
-    """Pretty-print the failure details for a single evaluated task."""
+    """Pretty-print the failure details for a single evaluated task result dict."""
     from .visualize import print_grid
 
     task_id = result.get("task_id", "?")

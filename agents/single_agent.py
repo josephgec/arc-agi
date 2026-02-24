@@ -1,15 +1,16 @@
 """Single-agent baseline for ARC-AGI.
 
-Flow per task:
-  1. Format all training pairs as a prompt
-  2. Ask the model to write `def transform(grid: np.ndarray) -> np.ndarray`
-  3. Extract and execute the function
-  4. If any training pair is wrong, feed pixel-level errors back and ask to fix
-  5. Repeat up to max_retries
+Solving flow per task:
+  1. Format all training pairs into a prompt.
+  2. Ask the model to write `def transform(grid: np.ndarray) -> np.ndarray`.
+  3. Extract the Python function from the response and execute it.
+  4. Evaluate the function against all training pairs.
+  5. If any pair is wrong, feed pixel-level error details back and ask for a fix.
+  6. Repeat up to max_retries times with increasing temperature for diversity.
 
-Backends:
-  - "ollama"     : local Ollama server (default, free, runs deepseek-r1:70b)
-  - "anthropic"  : Anthropic API (requires credits)
+Supported backends:
+  - "ollama"    : local Ollama server (free, default model: deepseek-r1:8b)
+  - "anthropic" : Anthropic API (requires credits, default model: claude-sonnet-4-6)
 """
 from __future__ import annotations
 
@@ -27,25 +28,31 @@ from arc.dsl import (
     find_objects, bounding_box, crop_to_content,
 )
 
-# DSL namespace injected into every generated function's exec scope
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+# DSL functions and numpy injected into every generated function's exec scope.
+# The model can use these without any imports.
 _DSL_NAMESPACE: dict[str, Any] = {
-    "np": np,
-    "numpy": np,
-    "crop": crop,
-    "rotate": rotate,
-    "flip": flip,
-    "translate": translate,
-    "scale": scale,
-    "tile": tile,
-    "recolor": recolor,
-    "mask": mask,
-    "overlay": overlay,
-    "flood_fill": flood_fill,
-    "find_objects": find_objects,
-    "bounding_box": bounding_box,
+    "np":              np,
+    "numpy":           np,
+    "crop":            crop,
+    "rotate":          rotate,
+    "flip":            flip,
+    "translate":       translate,
+    "scale":           scale,
+    "tile":            tile,
+    "recolor":         recolor,
+    "mask":            mask,
+    "overlay":         overlay,
+    "flood_fill":      flood_fill,
+    "find_objects":    find_objects,
+    "bounding_box":    bounding_box,
     "crop_to_content": crop_to_content,
 }
 
+# System prompt sent to the model at the start of every conversation.
 _SYSTEM_PROMPT = textwrap.dedent("""
     You are an expert Python programmer solving ARC-AGI puzzles.
 
@@ -85,19 +92,27 @@ _SYSTEM_PROMPT = textwrap.dedent("""
     - No imports, no print(), no input(), no I/O of any kind.
 """).strip()
 
-OLLAMA_BASE_URL = "http://localhost:11434/v1"
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-DEFAULT_OLLAMA_MODEL = "deepseek-r1:8b"
+# Backend connection settings
+OLLAMA_BASE_URL   = "http://localhost:11434/v1"
+OLLAMA_CHAT_URL   = "http://localhost:11434/api/chat"
+DEFAULT_OLLAMA_MODEL    = "deepseek-r1:8b"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
+# Temperature values used across retry attempts (greedy first, then exploratory).
+_TEMPERATURE_SCHEDULE = [0.0, 0.4, 0.8, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# Module-level helper functions (pure, no model I/O)
+# ---------------------------------------------------------------------------
 
 def _strip_thinking(text: str) -> str:
-    """Remove <think>...</think> blocks produced by deepseek-r1 and similar models."""
+    """Remove <think>…</think> blocks produced by deepseek-r1 and similar models."""
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 def _grid_to_str(grid: Grid) -> str:
-    """Render a grid as a compact Python list literal (for prompts)."""
+    """Render a grid as a compact Python list literal suitable for prompts."""
     rows = []
     for row in grid:
         rows.append("[" + ", ".join(str(int(v)) for v in row) + "]")
@@ -105,9 +120,15 @@ def _grid_to_str(grid: Grid) -> str:
 
 
 def _diff_summary(expected: Grid, predicted: Grid, max_show: int = 12) -> str:
-    """Summarise cell-level differences between two grids."""
+    """Return a human-readable summary of cell-level differences between two grids.
+
+    Lists up to max_show individual cell mismatches.  If more exist, appends a
+    count of the remaining differences.  Returns a shape-mismatch message when
+    the grids have different shapes.
+    """
     if expected.shape != predicted.shape:
         return f"Shape mismatch: expected {expected.shape}, got {predicted.shape}"
+
     diffs = []
     it = np.nditer([expected, predicted], flags=["multi_index"])
     while not it.finished:
@@ -118,13 +139,35 @@ def _diff_summary(expected: Grid, predicted: Grid, max_show: int = 12) -> str:
                 f"  ({r},{c}) expected {ev} ({COLOR_NAMES[ev]}) got {pv} ({COLOR_NAMES[pv]})"
             )
         it.iternext()
+
     if not diffs:
         return "  (no differences)"
+
     extra = f"\n  ... and {len(diffs) - max_show} more" if len(diffs) > max_show else ""
     return "\n".join(diffs[:max_show]) + extra
 
 
+# ---------------------------------------------------------------------------
+# SingleAgent
+# ---------------------------------------------------------------------------
+
 class SingleAgent:
+    """LLM-based agent that iteratively writes and self-corrects ARC transforms.
+
+    The agent formats each task as a prompt, asks the model to write a Python
+    `transform` function, evaluates it against training pairs, and feeds
+    pixel-level error feedback back to the model for self-correction.
+
+    Supports two backends:
+        - "ollama"    — local Ollama server (no API cost)
+        - "anthropic" — Anthropic cloud API
+    """
+
+    # Threshold (total cells across input + output) above which we cap the
+    # number of training pairs included in the prompt.
+    _LARGE_GRID_CELL_THRESHOLD = 300
+    _LARGE_GRID_MAX_PAIRS = 2
+
     def __init__(
         self,
         backend: str = "ollama",
@@ -133,24 +176,24 @@ class SingleAgent:
         timeout: float = 120.0,
         debug: bool = False,
     ):
-        """
+        """Initialise the agent.
+
         Args:
-            backend:     "ollama" (local, free) or "anthropic" (API credits required)
-            model:       Model name. Defaults to deepseek-r1:70b for ollama,
-                         claude-sonnet-4-6 for anthropic.
-            max_retries: Number of self-correction attempts after first try.
+            backend:     "ollama" (local, free) or "anthropic" (API credits required).
+            model:       Model name override.  Defaults to deepseek-r1:8b for ollama
+                         and claude-sonnet-4-6 for anthropic.
+            max_retries: Number of self-correction attempts after the first try.
             timeout:     Seconds to wait for a single model call (ollama only).
-            debug:       Print raw model responses for troubleshooting.
+            debug:       Print raw model responses to stdout for troubleshooting.
         """
         self.backend = backend
         self.max_retries = max_retries
         self.debug = debug
-
         self._timeout = timeout
 
         if backend == "ollama":
             self.model = model or DEFAULT_OLLAMA_MODEL
-            self.client = None  # native Ollama API used directly
+            self.client = None  # ollama is called via urllib; no client object needed
         elif backend == "anthropic":
             import anthropic
             self.model = model or DEFAULT_ANTHROPIC_MODEL
@@ -163,43 +206,44 @@ class SingleAgent:
     # ------------------------------------------------------------------
 
     def solve(self, task: dict, task_id: str = "") -> dict:
-        """Attempt to solve a task.
+        """Attempt to solve a task using the self-correction loop.
+
+        Runs up to max_retries + 1 model calls.  The temperature rises each
+        attempt to encourage more diverse completions on retries.
 
         Returns:
             {
-                'success': bool,
-                'code': str | None,
-                'n_attempts': int,
-                'log': list[dict],
+                'success':    bool      — True if all training pairs passed
+                'code':       str|None  — best code found (even if not fully correct)
+                'n_attempts': int       — number of model calls made
+                'log':        list[dict]— per-attempt details
             }
         """
         log: list[dict] = []
-        messages: list[dict] = []
-
-        messages.append({"role": "user", "content": self._format_task_prompt(task)})
+        messages: list[dict] = [
+            {"role": "user", "content": self._format_task_prompt(task)}
+        ]
 
         best_code: str | None = None
         best_n_correct: int = -1
 
-        # Temperature schedule: greedy on first attempt, increasingly exploratory on retries
-        _temps = [0.0, 0.4, 0.8, 1.0]
-
         for attempt in range(1, self.max_retries + 2):
-            temperature = _temps[min(attempt - 1, len(_temps) - 1)]
+            temperature = _TEMPERATURE_SCHEDULE[min(attempt - 1, len(_TEMPERATURE_SCHEDULE) - 1)]
+
+            # --- Call the model ---
             try:
                 response_text = self._call_model(messages, temperature=temperature)
             except TimeoutError as e:
-                entry = {"attempt": attempt, "error": f"timeout: {e}", "n_correct": 0}
-                log.append(entry)
+                log.append({"attempt": attempt, "error": f"timeout: {e}", "n_correct": 0})
                 break
             except Exception as e:
-                entry = {"attempt": attempt, "error": f"model_error: {e}", "n_correct": 0}
-                log.append(entry)
+                log.append({"attempt": attempt, "error": f"model_error: {e}", "n_correct": 0})
                 break
+
             messages.append({"role": "assistant", "content": response_text})
 
-            # Strip chain-of-thought thinking tags before extracting code.
-            # Fall back to the raw response in case the model put code inside <think>.
+            # Strip chain-of-thought tags before extracting code.
+            # Fall back to the raw response in case the model embedded code inside <think>.
             clean_response = _strip_thinking(response_text)
             code = self._extract_code(clean_response) or self._extract_code(response_text)
 
@@ -208,40 +252,43 @@ class SingleAgent:
                 print(response_text[:3000])
                 print(f"--- END (code extracted: {code is not None}) ---\n")
 
+            # --- No code block found ---
             if code is None:
-                entry = {"attempt": attempt, "error": "no_code_block", "n_correct": 0}
-                log.append(entry)
+                log.append({"attempt": attempt, "error": "no_code_block", "n_correct": 0})
                 messages.append({
                     "role": "user",
                     "content": "Your response didn't contain a ```python``` code block. Please try again.",
                 })
                 continue
 
+            # --- Evaluate the extracted code ---
             eval_result = self._evaluate_code(code, task)
             n_correct = eval_result["n_correct"]
             n_total = eval_result["n_total"]
 
-            entry = {
-                "attempt": attempt,
-                "code": code,
-                "n_correct": n_correct,
-                "n_total": n_total,
+            log.append({
+                "attempt":     attempt,
+                "code":        code,
+                "n_correct":   n_correct,
+                "n_total":     n_total,
                 "all_correct": eval_result["all_correct"],
-            }
-            log.append(entry)
+            })
 
+            # Track the best solution seen so far
             if n_correct > best_n_correct:
                 best_n_correct = n_correct
                 best_code = code
 
+            # Success: every training pair is correct
             if eval_result["all_correct"]:
                 return {
-                    "success": True,
-                    "code": best_code,
+                    "success":    True,
+                    "code":       best_code,
                     "n_attempts": attempt,
-                    "log": log,
+                    "log":        log,
                 }
 
+            # Not yet correct — add error feedback for the next attempt
             if attempt <= self.max_retries:
                 messages.append({
                     "role": "user",
@@ -249,14 +296,18 @@ class SingleAgent:
                 })
 
         return {
-            "success": False,
-            "code": best_code,
+            "success":    False,
+            "code":       best_code,
             "n_attempts": self.max_retries + 1,
-            "log": log,
+            "log":        log,
         }
 
     def predict(self, task: dict) -> Grid | None:
-        """Solve and apply the best code to the test input."""
+        """Solve a task and apply the best code to the first test input.
+
+        Returns the predicted output Grid, or None if no working code was found
+        or if the best code raises an exception on the test input.
+        """
         result = self.solve(task)
         if result["code"] is None:
             return None
@@ -272,13 +323,21 @@ class SingleAgent:
 
     @staticmethod
     def _block_analysis(inp: Grid, out: Grid) -> str | None:
-        """If output is an exact NxM tiling of input-sized blocks, return a
-        pre-computed block analysis string to help the model spot the rule."""
+        """Compute a block-structure analysis to include in the task prompt.
+
+        If the output dimensions are an exact N×M multiple of the input
+        dimensions, the output can be divided into input-sized blocks.
+        This helper describes each block's content and which input cell it
+        corresponds to, helping the model spot tiling-based rules.
+
+        Returns None when the output is not a whole multiple of the input.
+        """
         ih, iw = inp.shape
         oh, ow = out.shape
         if oh % ih != 0 or ow % iw != 0:
             return None
-        br, bc = oh // ih, ow // iw  # block grid dimensions
+
+        br, bc = oh // ih, ow // iw  # number of block rows/cols
         lines = [f"  (Output divided into {br}×{bc} blocks, each {ih}×{iw}:)"]
         for r in range(br):
             for c in range(bc):
@@ -287,28 +346,29 @@ class SingleAgent:
                 if np.all(block == 0):
                     desc = "all zeros"
                 else:
-                    # Always show the actual block content so the model can see
-                    # what values appear (e.g. the full input pattern, not just the cell value)
+                    # Show the actual block content so the model can see values
                     desc = _grid_to_str(block)
                     if np.array_equal(block, inp):
                         desc += "  ← this is the complete input grid (note: contains its own zeros too)"
                 lines.append(f"  block({r},{c}): input[{r}][{c}]={cell_val} → {desc}")
         return "\n".join(lines)
 
-    # Max cells (input + output) per pair before we cap the number of pairs shown
-    _LARGE_GRID_CELL_THRESHOLD = 300
-    _LARGE_GRID_MAX_PAIRS = 2
-
     def _format_task_prompt(self, task: dict) -> str:
+        """Build the initial user prompt describing the ARC task.
+
+        For tasks with large grids (above _LARGE_GRID_CELL_THRESHOLD cells per
+        pair), the number of training pairs shown is capped to avoid overflowing
+        the model's context window.
+        """
         parts = [
             "Here is an ARC-AGI puzzle. Study the training examples and find the transformation rule.\n"
         ]
         train_pairs = task["train"]
-        # For tasks with large grids, cap the number of pairs to avoid context overflow
+
+        # Decide how many pairs to show based on the largest pair's cell count
         max_cells = max(
-            inp.size + out.size
+            p["input"].size + p["output"].size
             for p in train_pairs
-            for inp, out in [(p["input"], p["output"])]
         )
         if max_cells > self._LARGE_GRID_CELL_THRESHOLD:
             train_pairs = train_pairs[: self._LARGE_GRID_MAX_PAIRS]
@@ -329,7 +389,9 @@ class SingleAgent:
             parts.append("")
 
         test_inp = task["test"][0]["input"]
-        parts.append(f"### Test input ({test_inp.shape[0]}×{test_inp.shape[1]}):\n{_grid_to_str(test_inp)}\n")
+        parts.append(
+            f"### Test input ({test_inp.shape[0]}×{test_inp.shape[1]}):\n{_grid_to_str(test_inp)}\n"
+        )
         parts.append(
             "Explain your reasoning, then write the `transform` function that produces "
             "the correct output for ANY input following this rule."
@@ -337,9 +399,15 @@ class SingleAgent:
         return "\n".join(parts)
 
     def _format_error_feedback(self, eval_result: dict, attempt: int) -> str:
+        """Build the feedback message sent after a failed attempt.
+
+        Includes per-pair correctness, exception messages, full expected/predicted
+        grids, and a cell-level diff summary to help the model identify its mistake.
+        """
+        n_wrong = eval_result["n_total"] - eval_result["n_correct"]
         lines = [
-            f"Your function was incorrect on {eval_result['n_total'] - eval_result['n_correct']} "
-            f"of {eval_result['n_total']} training pairs. Here are the details:\n"
+            f"Your function was incorrect on {n_wrong} of {eval_result['n_total']} "
+            f"training pairs. Here are the details:\n"
         ]
         for i, pair in enumerate(eval_result["pairs"]):
             if pair["correct"]:
@@ -368,9 +436,13 @@ class SingleAgent:
 
     @staticmethod
     def _truncate_to_valid_function(block: str) -> str | None:
-        """Given a block that may have prose after the function body, trim trailing
-        lines until the block is valid Python containing a def.  Returns the
-        longest valid prefix, or None if none exists."""
+        """Trim trailing prose from a code block until it becomes valid Python.
+
+        Some models append grid literals or natural-language explanation after
+        the function body.  This method strips lines from the end one-by-one
+        until ast.parse succeeds (and a `def` is present), returning the longest
+        valid prefix.  Returns None if no valid prefix exists.
+        """
         import ast
         lines = block.split("\n")
         for end in range(len(lines), 0, -1):
@@ -385,34 +457,56 @@ class SingleAgent:
         return None
 
     def _extract_code(self, text: str) -> str | None:
-        # Collect all fenced code blocks (case-insensitive lang tag).
-        # Reasoning models iterate through many drafts; we want the last block
-        # that actually contains a function definition and is valid Python.
+        """Extract the best Python function from a model response.
+
+        Strategy:
+        1. Collect all fenced ```python … ``` blocks (case-insensitive tag).
+        2. Iterate in reverse (last block first), looking for one that:
+           - contains a `def` statement, and
+           - is syntactically valid Python.
+           If a block has prose trailing after the function, attempt to trim it.
+        3. Fall back to a bare `def …` found anywhere in the text.
+
+        Returning the *last* valid block matches the behaviour of reasoning
+        models that draft multiple versions and refine toward the end.
+        """
         matches = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
         if matches:
             import ast
             for block in reversed(matches):
                 block = block.strip()
-                if "def " in block:
-                    try:
-                        ast.parse(block)
-                        return block  # last syntactically-valid block with a def
-                    except SyntaxError:
-                        # Prose may trail the function — try to trim it off
-                        trimmed = self._truncate_to_valid_function(block)
-                        if trimmed:
-                            return trimmed
-            # Nothing valid found
-            return None
+                if "def " not in block:
+                    continue
+                try:
+                    ast.parse(block)
+                    return block  # last syntactically-valid block with a def
+                except SyntaxError:
+                    # Prose may trail the function — try trimming it off
+                    trimmed = self._truncate_to_valid_function(block)
+                    if trimmed:
+                        return trimmed
+            return None  # no valid block found among all fenced blocks
+
+        # No fenced blocks at all — try to find a bare function definition
         match = re.search(r"(def \w+\(.*)", text, re.DOTALL)
         if match:
             return match.group(1).strip()
         return None
 
     def _execute(self, code: str, input_grid: Grid) -> tuple[Grid | None, str | None]:
+        """Execute generated code and run the transform function on input_grid.
+
+        The code runs in an isolated namespace seeded with the DSL functions and
+        numpy.  stdout is suppressed to prevent print() calls polluting output.
+
+        Returns a (result_grid, error_message) tuple.  Exactly one of the two
+        will be None.
+        """
         import io
         import contextlib
 
+        # Reject code that attempts to read from stdin — the grid is passed as
+        # an argument so stdin access indicates a misunderstanding by the model.
         if "input(" in code or "sys.stdin" in code:
             return None, "Code uses input()/stdin — not allowed; grid is passed as argument."
 
@@ -423,12 +517,15 @@ class SingleAgent:
         except Exception as e:
             return None, f"Compile error: {type(e).__name__}: {e}"
 
+        # Prefer a function literally named "transform"; fall back to any
+        # user-defined callable in the namespace (models sometimes use other names).
         transform_fn = namespace.get("transform")
         if transform_fn is None:
-            # Accept any user-defined callable — models sometimes use a different name
             user_fns = [
                 v for k, v in namespace.items()
-                if callable(v) and k not in _DSL_NAMESPACE and not k.startswith("_")
+                if callable(v)
+                and k not in _DSL_NAMESPACE
+                and not k.startswith("_")
                 and k != "__builtins__"
             ]
             if user_fns:
@@ -438,6 +535,7 @@ class SingleAgent:
 
         try:
             with contextlib.redirect_stdout(io.StringIO()):
+                # Pass a copy so that in-place mutations don't affect the original
                 result = transform_fn(input_grid.copy())
             if not isinstance(result, np.ndarray):
                 result = np.array(result, dtype=np.int32)
@@ -446,43 +544,50 @@ class SingleAgent:
             return None, f"Runtime error: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
     def _evaluate_code(self, code: str, task: dict) -> dict:
+        """Run the generated code against all training pairs and collect results.
+
+        Returns the same structure as evaluate_task() in arc/evaluate.py, but
+        uses _execute() for isolation rather than calling the function directly.
+        """
         pairs = []
         for pair in task["train"]:
             output, error = self._execute(code, pair["input"])
             if error:
                 pairs.append({
-                    "correct": False,
+                    "correct":   False,
                     "predicted": None,
-                    "expected": pair["output"],
-                    "error": error,
+                    "expected":  pair["output"],
+                    "error":     error,
                 })
             else:
                 correct = grids_equal(output, pair["output"])
                 pairs.append({
-                    "correct": correct,
+                    "correct":   correct,
                     "predicted": output,
-                    "expected": pair["output"],
-                    "error": None,
+                    "expected":  pair["output"],
+                    "error":     None,
                 })
 
         n_correct = sum(p["correct"] for p in pairs)
         return {
-            "pairs": pairs,
-            "n_correct": n_correct,
-            "n_total": len(pairs),
+            "pairs":       pairs,
+            "n_correct":   n_correct,
+            "n_total":     len(pairs),
             "all_correct": n_correct == len(pairs),
         }
 
     # ------------------------------------------------------------------
-    # Model API (backend-agnostic)
+    # Model API (backend-agnostic routing)
     # ------------------------------------------------------------------
 
     def _call_model(self, messages: list[dict], temperature: float = 0.0) -> str:
+        """Route a model call to the configured backend and return the response text."""
         if self.backend == "anthropic":
             return self._call_anthropic(messages)
         return self._call_ollama(messages, temperature=temperature)
 
     def _call_anthropic(self, messages: list[dict]) -> str:
+        """Send a chat request to the Anthropic API and return the response text."""
         response = self.client.messages.create(
             model=self.model,
             max_tokens=8192,
@@ -492,6 +597,18 @@ class SingleAgent:
         return response.content[0].text
 
     def _call_ollama(self, messages: list[dict], temperature: float = 0.0) -> str:
+        """Send a streaming chat request to the local Ollama server.
+
+        Streams the NDJSON response line-by-line so we can:
+          - exit early once a complete code block is detected (saves time), and
+          - recover partial results if the wall-clock deadline is reached.
+
+        Thinking tokens (from extended-thinking models like deepseek-r1) are
+        collected separately and wrapped in <think>…</think> tags so that
+        _strip_thinking() can remove them uniformly.
+
+        Raises TimeoutError if the server never responds at all.
+        """
         import json
         import socket
         import time
@@ -500,12 +617,12 @@ class SingleAgent:
 
         full_messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + messages
         payload = json.dumps({
-            "model": self.model,
+            "model":   self.model,
             "messages": full_messages,
-            "stream": True,  # stream so we can exit early & recover partial results
+            "stream":  True,  # streaming lets us exit early and recover partials
             "options": {
                 "temperature": temperature,
-                "num_predict": 32000,  # budget-forces model to conclude; at ~40 tok/s ≈ 800s
+                "num_predict": 32000,  # token budget; at ~40 tok/s ≈ 800 s max
             },
         }).encode()
 
@@ -517,9 +634,10 @@ class SingleAgent:
         )
 
         thinking_parts: list[str] = []
-        content_parts: list[str] = []
-        # Per-read socket timeout: shorter than overall deadline so we can check
-        # wall-clock time between chunks.
+        content_parts:  list[str] = []
+
+        # Per-read socket timeout: shorter than the overall deadline so we can
+        # check wall-clock time between individual chunk reads.
         _READ_TIMEOUT = min(self._timeout, 60)
         deadline = time.monotonic() + self._timeout
 
@@ -529,30 +647,35 @@ class SingleAgent:
                     try:
                         chunk = json.loads(raw_line.strip())
                     except (json.JSONDecodeError, ValueError):
-                        continue
+                        continue  # skip malformed lines
 
                     msg = chunk.get("message", {})
                     thinking_parts.append(msg.get("thinking") or "")
                     content_parts.append(msg.get("content") or "")
 
                     if chunk.get("done"):
-                        break
+                        break  # server signalled completion
 
-                    # Early exit: complete code block found in content
+                    # Early-exit: a complete code block is already present —
+                    # no need to wait for reasoning or follow-up prose.
                     content_so_far = "".join(content_parts)
                     if (
                         content_so_far.count("```") >= 2
                         and "def " in content_so_far
-                        and re.search(r"```(?:python)?\s.*?```", content_so_far, re.DOTALL | re.IGNORECASE)
+                        and re.search(
+                            r"```(?:python)?\s.*?```",
+                            content_so_far,
+                            re.DOTALL | re.IGNORECASE,
+                        )
                     ):
                         break
 
-                    # Deadline check (wall clock)
+                    # Deadline check: stop reading if wall-clock time is up.
                     if time.monotonic() > deadline:
                         break
 
         except socket.timeout as e:
-            # Per-read socket timeout — treat as overall timeout only if we got nothing
+            # Per-read timeout fired.  If we received nothing, it's a hard failure.
             if not thinking_parts and not content_parts:
                 raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
         except urllib.error.URLError as e:
@@ -563,12 +686,12 @@ class SingleAgent:
                 raise
 
         thinking = "".join(thinking_parts)
-        content = "".join(content_parts)
+        content  = "".join(content_parts)
 
         if self.debug:
             print(f"[debug] content length={len(content)}  thinking length={len(thinking)}")
 
-        # Reassemble so _strip_thinking can handle it uniformly
+        # Reassemble thinking + content so _strip_thinking() handles it uniformly
         if thinking and content:
             return f"<think>{thinking}</think>\n{content}"
         if thinking:

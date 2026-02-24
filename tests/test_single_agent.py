@@ -1,4 +1,7 @@
-"""Tests for agents/single_agent.py (Anthropic API is mocked throughout)."""
+"""Tests for agents/single_agent.py.
+
+The Anthropic API and urllib are mocked throughout so no network calls are made.
+"""
 from __future__ import annotations
 
 import json
@@ -11,11 +14,11 @@ from agents.single_agent import SingleAgent, _grid_to_str, _diff_summary, _strip
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Test helpers
 # ---------------------------------------------------------------------------
 
 def make_agent() -> SingleAgent:
-    """Return a SingleAgent backed by mocked Anthropic client."""
+    """Return a SingleAgent backed by a mocked Anthropic client."""
     with patch("anthropic.Anthropic"):
         agent = SingleAgent(backend="anthropic", model="claude-sonnet-4-6", max_retries=2)
     agent.client = MagicMock()
@@ -23,10 +26,38 @@ def make_agent() -> SingleAgent:
 
 
 def _mock_response(text: str) -> MagicMock:
-    """Simulate an Anthropic API response."""
+    """Build a mock object that mimics an Anthropic API response."""
     msg = MagicMock()
     msg.content = [MagicMock(text=text)]
     return msg
+
+
+def _ollama_ctx(content: str = "", thinking: str = "") -> MagicMock:
+    """Return a context-manager mock for urllib.request.urlopen (streaming NDJSON).
+
+    The mock yields NDJSON lines that mirror Ollama's streaming chat format:
+    - Optional thinking chunk (if thinking is non-empty)
+    - Optional content chunk (if content is non-empty)
+    - A final done=True chunk
+    """
+    lines: list[bytes] = []
+    if thinking:
+        lines.append(
+            json.dumps({"message": {"content": "", "thinking": thinking}, "done": False}).encode() + b"\n"
+        )
+    if content:
+        lines.append(
+            json.dumps({"message": {"content": content, "thinking": ""}, "done": False}).encode() + b"\n"
+        )
+    lines.append(
+        json.dumps({"message": {"content": "", "thinking": ""}, "done": True}).encode() + b"\n"
+    )
+
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=cm)
+    cm.__exit__ = MagicMock(return_value=False)
+    cm.__iter__ = lambda self: iter(lines)
+    return cm
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +85,7 @@ class TestStripThinking:
 
 
 # ---------------------------------------------------------------------------
-# SingleAgent init
+# SingleAgent.__init__
 # ---------------------------------------------------------------------------
 
 class TestSingleAgentInit:
@@ -64,7 +95,7 @@ class TestSingleAgentInit:
         assert "deepseek" in agent.model
 
     def test_ollama_client_is_none(self):
-        """Ollama backend uses urllib directly; no client object needed."""
+        """Ollama uses urllib directly; no SDK client object is needed."""
         agent = SingleAgent(backend="ollama")
         assert agent.client is None
 
@@ -106,9 +137,10 @@ class TestGridToStr:
         assert "1" in s and "2" in s and "3" in s
 
     def test_multirow(self):
+        """Multi-row grids should have at least one bracket per row."""
         g = np.array([[1, 0], [0, 1]], dtype=np.int32)
         s = _grid_to_str(g)
-        assert s.count("[") >= 2  # at least 2 inner rows
+        assert s.count("[") >= 2
 
     def test_is_string(self):
         g = np.zeros((2, 2), dtype=np.int32)
@@ -126,21 +158,19 @@ class TestDiffSummary:
 
     def test_shape_mismatch(self):
         a = np.array([[1, 2]], dtype=np.int32)
-        b = np.array([[1]], dtype=np.int32)
-        summary = _diff_summary(a, b)
-        assert "Shape mismatch" in summary
+        b = np.array([[1]],    dtype=np.int32)
+        assert "Shape mismatch" in _diff_summary(a, b)
 
     def test_lists_differing_cells(self):
         a = np.array([[1, 2]], dtype=np.int32)
         b = np.array([[1, 3]], dtype=np.int32)
-        summary = _diff_summary(a, b)
-        assert "(0,1)" in summary
+        assert "(0,1)" in _diff_summary(a, b)
 
     def test_truncates_at_max_show(self):
+        """More than max_show differences should append a '…more' annotation."""
         a = np.zeros((5, 5), dtype=np.int32)
-        b = np.ones((5, 5), dtype=np.int32)
-        summary = _diff_summary(a, b, max_show=3)
-        assert "more" in summary
+        b = np.ones( (5, 5), dtype=np.int32)
+        assert "more" in _diff_summary(a, b, max_show=3)
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +198,13 @@ class TestFormatTaskPrompt:
         assert isinstance(agent._format_task_prompt(simple_task), str)
 
     def test_multiple_training_pairs_shown(self, simple_task):
+        """Both training pairs in simple_task should appear in the prompt."""
         agent = make_agent()
         prompt = agent._format_task_prompt(simple_task)
         assert "Training pair 2" in prompt
 
     def test_large_grid_caps_pairs_shown(self):
-        """Tasks with large grids (>300 cells/pair) should cap training pairs shown."""
+        """Tasks with grids over the cell threshold should cap training pairs."""
         # 20×20 = 400 cells > threshold of 300
         big = np.zeros((20, 20), dtype=np.int32)
         task = {
@@ -187,12 +218,11 @@ class TestFormatTaskPrompt:
         }
         agent = make_agent()
         prompt = agent._format_task_prompt(task)
-        # Should show at most _LARGE_GRID_MAX_PAIRS (2) pairs
-        from agents.single_agent import SingleAgent
+        # _LARGE_GRID_MAX_PAIRS == 2, so pair 3 must not appear
         assert "Training pair 3" not in prompt
 
     def test_small_grid_shows_all_pairs(self):
-        """Small grids should not be truncated."""
+        """Small grids should not be truncated regardless of count."""
         small = np.ones((2, 2), dtype=np.int32)
         task = {
             "train": [
@@ -220,6 +250,7 @@ class TestExtractCode:
         assert "def transform" in code
 
     def test_extracts_bare_def(self):
+        """A bare `def` outside any code fence should be extracted as a fallback."""
         agent = make_agent()
         text = "Here you go:\ndef transform(grid):\n    return grid\n"
         code = agent._extract_code(text)
@@ -237,7 +268,7 @@ class TestExtractCode:
         assert not code.startswith("\n")
 
     def test_returns_last_block_not_first(self):
-        """Reasoning models iterate — the last code block is most refined."""
+        """Reasoning models iterate; the last code block is the most refined."""
         agent = make_agent()
         text = (
             "First attempt:\n```python\ndef transform(grid):\n    return grid * 0\n```\n"
@@ -248,7 +279,7 @@ class TestExtractCode:
         assert "return grid * 0" not in code
 
     def test_multiple_blocks_last_is_returned(self):
-        """With 3+ blocks, the very last one is returned."""
+        """With 5 blocks, the very last syntactically-valid one is returned."""
         agent = make_agent()
         blocks = "\n".join(
             f"```python\ndef transform(grid):\n    return grid + {i}\n```"
@@ -258,11 +289,10 @@ class TestExtractCode:
         assert "return grid + 4" in code
 
     def test_grid_literal_block_rejected(self):
-        """A code block containing only a grid literal (no def) returns None."""
+        """A code block with no `def` (just a grid literal) should return None."""
         agent = make_agent()
         text = "```python\n[[1, 2], [3, 4]]\n```"
-        code = agent._extract_code(text)
-        assert code is None
+        assert agent._extract_code(text) is None
 
     def test_prefers_def_block_over_grid_literal(self):
         """When both a grid literal and a def block exist, the def block wins."""
@@ -286,14 +316,14 @@ class TestExtractCode:
         assert "return grid.copy()" in code
 
     def test_prose_trailing_function_trimmed(self):
-        """Code block with prose after the function body should be salvaged."""
+        """Code with prose after the function body should be salvaged by trimming."""
         agent = make_agent()
         text = (
             "```python\n"
             "def transform(grid):\n"
             "    return grid.copy()\n"
             "\n"
-            "Then we test it with example 1.\n"  # prose trailing after function
+            "Then we test it with example 1.\n"
             "Output: [[1,2],[3,4]]\n"
             "```"
         )
@@ -309,14 +339,13 @@ class TestExtractCode:
 
 class TestTruncateToValidFunction:
     def test_clean_function_unchanged(self):
-        from agents.single_agent import SingleAgent
         block = "def transform(grid):\n    return grid.copy()"
         result = SingleAgent._truncate_to_valid_function(block)
         assert result is not None
         assert "def transform" in result
 
     def test_prose_suffix_removed(self):
-        from agents.single_agent import SingleAgent
+        """Trailing prose lines must be stripped to yield a valid function."""
         block = "def transform(grid):\n    return grid.copy()\n\nThen test it.\nOutput: [[1]]"
         result = SingleAgent._truncate_to_valid_function(block)
         assert result is not None
@@ -324,12 +353,11 @@ class TestTruncateToValidFunction:
         assert "def transform" in result
 
     def test_returns_none_for_pure_prose(self):
-        from agents.single_agent import SingleAgent
         result = SingleAgent._truncate_to_valid_function("This is just prose.")
         assert result is None
 
     def test_returns_none_for_no_def(self):
-        from agents.single_agent import SingleAgent
+        """Valid Python without a function definition should return None."""
         result = SingleAgent._truncate_to_valid_function("x = 1\ny = 2")
         assert result is None
 
@@ -349,27 +377,25 @@ class TestBlockAnalysis:
 
     def test_returns_string_for_divisible_output(self):
         inp = self._inp()
-        out = np.tile(inp, (2, 2))  # 4×4 — two blocks each direction
-        result = SingleAgent._block_analysis(inp, out)
-        assert isinstance(result, str)
+        out = np.tile(inp, (2, 2))  # 4×4 = two blocks in each direction
+        assert isinstance(SingleAgent._block_analysis(inp, out), str)
 
     def test_identifies_all_zeros_block(self):
+        """A block filled with zeros should be labelled 'all zeros'."""
         inp = np.array([[0, 1], [1, 1]], dtype=np.int32)
-        # Manually build a 4×4 output where block(0,0) is zeros
+        # Build a 4×4 output where block(0,0) is all zeros
         out = np.zeros((4, 4), dtype=np.int32)
-        out[0:2, 2:4] = inp  # block(0,1) = inp
-        out[2:4, 0:2] = inp  # block(1,0) = inp
-        out[2:4, 2:4] = inp  # block(1,1) = inp
-        analysis = SingleAgent._block_analysis(inp, out)
-        assert "all zeros" in analysis
+        out[0:2, 2:4] = inp  # block(0,1)
+        out[2:4, 0:2] = inp  # block(1,0)
+        out[2:4, 2:4] = inp  # block(1,1)
+        assert "all zeros" in SingleAgent._block_analysis(inp, out)
 
     def test_identifies_input_grid_block(self):
+        """A block that equals the full input should be annotated accordingly."""
         inp = self._inp()
-        # block(0,0) = inp, rest zeros
         out = np.zeros((4, 4), dtype=np.int32)
-        out[0:2, 0:2] = inp
-        analysis = SingleAgent._block_analysis(inp, out)
-        assert "input grid" in analysis.lower()
+        out[0:2, 0:2] = inp  # block(0,0) = inp
+        assert "input grid" in SingleAgent._block_analysis(inp, out).lower()
 
     def test_block_positions_referenced(self):
         inp = self._inp()
@@ -384,39 +410,15 @@ class TestBlockAnalysis:
         out = np.tile(inp, (2, 2))
         task = {
             "train": [{"input": inp, "output": out}],
-            "test": [{"input": inp}],
+            "test":  [{"input": inp}],
         }
         agent = make_agent()
-        prompt = agent._format_task_prompt(task)
-        assert "block(" in prompt
+        assert "block(" in agent._format_task_prompt(task)
 
 
 # ---------------------------------------------------------------------------
-# _call_ollama — native Ollama API (urllib mocked)
+# _call_ollama — streaming Ollama API (urllib mocked)
 # ---------------------------------------------------------------------------
-
-def _ollama_ctx(content: str = "", thinking: str = "") -> MagicMock:
-    """Return a context-manager mock for urllib.request.urlopen (streaming NDJSON)."""
-    lines: list[bytes] = []
-    if thinking:
-        lines.append(
-            json.dumps({"message": {"content": "", "thinking": thinking}, "done": False}).encode() + b"\n"
-        )
-    if content:
-        lines.append(
-            json.dumps({"message": {"content": content, "thinking": ""}, "done": False}).encode() + b"\n"
-        )
-    lines.append(
-        json.dumps({"message": {"content": "", "thinking": ""}, "done": True}).encode() + b"\n"
-    )
-
-    cm = MagicMock()
-    cm.__enter__ = MagicMock(return_value=cm)
-    cm.__exit__ = MagicMock(return_value=False)
-    # Streaming: iterating the response yields NDJSON lines
-    cm.__iter__ = lambda self: iter(lines)
-    return cm
-
 
 class TestCallOllama:
     def _agent(self) -> SingleAgent:
@@ -429,12 +431,14 @@ class TestCallOllama:
         assert result == "Hello"
 
     def test_thinking_only_wrapped_in_tags(self):
+        """Thinking-only responses should be wrapped in <think> tags."""
         agent = self._agent()
         with patch("urllib.request.urlopen", return_value=_ollama_ctx(thinking="I reasoned")):
             result = agent._call_ollama([{"role": "user", "content": "hi"}])
         assert result == "<think>I reasoned</think>"
 
     def test_thinking_and_content_combined(self):
+        """Responses with both thinking and content should include both parts."""
         agent = self._agent()
         with patch("urllib.request.urlopen", return_value=_ollama_ctx(content="Answer", thinking="reasoning")):
             result = agent._call_ollama([{"role": "user", "content": "hi"}])
@@ -448,6 +452,7 @@ class TestCallOllama:
         assert result == ""
 
     def test_timeout_raises_timeout_error(self):
+        """A socket.timeout with no partial data must be re-raised as TimeoutError."""
         import socket
         agent = self._agent()
         with patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")):
@@ -455,32 +460,34 @@ class TestCallOllama:
                 agent._call_ollama([{"role": "user", "content": "hi"}])
 
     def test_partial_result_returned_on_deadline(self):
-        """When the deadline is exceeded mid-stream, partial thinking is returned."""
+        """When the wall-clock deadline fires mid-stream, partial data is returned."""
         import time
         agent = SingleAgent(backend="ollama", timeout=0.001)  # nearly-zero deadline
-        # The mock immediately yields done=False, then done=True — but deadline fires first
-        thinking_chunk = json.dumps({
-            "message": {"content": "", "thinking": "partial thinking"},
-            "done": False,
-        }).encode() + b"\n"
-        done_chunk = json.dumps({
-            "message": {"content": "", "thinking": ""},
-            "done": True,
-        }).encode() + b"\n"
+
+        thinking_chunk = (
+            json.dumps({"message": {"content": "", "thinking": "partial thinking"}, "done": False}).encode()
+            + b"\n"
+        )
+        done_chunk = (
+            json.dumps({"message": {"content": "", "thinking": ""}, "done": True}).encode()
+            + b"\n"
+        )
 
         cm = MagicMock()
         cm.__enter__ = MagicMock(return_value=cm)
-        cm.__exit__ = MagicMock(return_value=False)
-        # Simulate slow iteration so deadline fires between chunks
+        cm.__exit__  = MagicMock(return_value=False)
+
         def slow_iter():
             yield thinking_chunk
-            time.sleep(0.01)   # sleep past the 0.001s deadline
+            time.sleep(0.01)  # sleep past the 0.001s deadline
             yield done_chunk
+
         cm.__iter__ = lambda self: slow_iter()
 
         with patch("urllib.request.urlopen", return_value=cm):
             result = agent._call_ollama([{"role": "user", "content": "hi"}])
-        # Should return the partial thinking, not raise TimeoutError
+
+        # Should return partial thinking rather than raise TimeoutError
         assert "partial thinking" in result
 
 
@@ -497,7 +504,6 @@ class TestExecute:
         code = "def transform(grid):\n    return grid.copy()"
         output, error = agent._execute(code, self._g())
         assert error is None
-        assert output is not None
         np.testing.assert_array_equal(output, self._g())
 
     def test_compile_error_caught(self):
@@ -516,7 +522,7 @@ class TestExecute:
 
     def test_missing_transform_fn(self):
         agent = make_agent()
-        code = "x = 1"  # no transform defined
+        code = "x = 1"  # no function defined at all
         output, error = agent._execute(code, self._g())
         assert output is None
         assert error is not None
@@ -528,6 +534,7 @@ class TestExecute:
         assert output.dtype == np.int32
 
     def test_list_output_converted(self):
+        """A function returning a nested list should be auto-converted to ndarray."""
         agent = make_agent()
         code = "def transform(grid):\n    return [[0, 0], [0, 0]]"
         output, error = agent._execute(code, self._g())
@@ -535,6 +542,7 @@ class TestExecute:
         assert isinstance(output, np.ndarray)
 
     def test_dsl_available(self):
+        """DSL helpers like recolor() must be available without imports."""
         agent = make_agent()
         code = "def transform(grid):\n    return recolor(grid, 1, 9)"
         g = np.array([[1, 0]], dtype=np.int32)
@@ -543,6 +551,7 @@ class TestExecute:
         assert output[0, 0] == 9
 
     def test_numpy_available_as_np(self):
+        """numpy must be importable as `np` inside generated code."""
         agent = make_agent()
         code = "def transform(grid):\n    return np.zeros((2, 2), dtype=np.int32)"
         output, error = agent._execute(code, self._g())
@@ -550,7 +559,7 @@ class TestExecute:
         assert output.shape == (2, 2)
 
     def test_fallback_to_any_callable_when_no_transform(self):
-        """If the model names the function differently, we still use it."""
+        """If the model names its function differently, the agent should still use it."""
         agent = make_agent()
         code = "def my_func(grid):\n    return grid.copy()"
         output, error = agent._execute(code, self._g())
@@ -558,15 +567,15 @@ class TestExecute:
         np.testing.assert_array_equal(output, self._g())
 
     def test_fallback_ignores_dsl_helpers(self):
-        """The fallback should not accidentally pick a DSL function."""
+        """The callable fallback must not accidentally pick a DSL function."""
         agent = make_agent()
-        # Only a non-transform name defined; DSL names should be ignored
         code = "def solve(grid):\n    return np.zeros((1, 1), dtype=np.int32)"
         output, error = agent._execute(code, self._g())
         assert error is None
         assert output.shape == (1, 1)
 
     def test_input_not_mutated(self):
+        """The original input grid must not be modified, even if code tries to."""
         agent = make_agent()
         code = "def transform(grid):\n    grid[0, 0] = 99\n    return grid"
         original = self._g()
@@ -584,7 +593,7 @@ class TestExecute:
         assert "stdin" in error.lower() or "input" in error.lower()
 
     def test_stdin_sys_stdin_rejected(self):
-        """Code using sys.stdin must be rejected."""
+        """Code referencing sys.stdin must also be rejected."""
         agent = make_agent()
         code = "import sys\ndef transform(grid):\n    data = sys.stdin.read()\n    return grid"
         output, error = agent._execute(code, self._g())
@@ -610,6 +619,7 @@ class TestEvaluateCode:
         assert result["n_correct"] == 0
 
     def test_error_captured_in_pair(self, simple_task):
+        """Exceptions during evaluation must be stored per-pair, not raised."""
         agent = make_agent()
         code = "def transform(grid):\n    raise ValueError('x')"
         result = agent._evaluate_code(code, simple_task)
@@ -630,22 +640,22 @@ class TestEvaluateCode:
 class TestFormatErrorFeedback:
     def test_mentions_wrong_pairs(self, simple_task):
         agent = make_agent()
-        code = "def transform(grid):\n    return grid"
-        eval_result = agent._evaluate_code(code, simple_task)
+        eval_result = agent._evaluate_code("def transform(grid):\n    return grid", simple_task)
         feedback = agent._format_error_feedback(eval_result, attempt=1)
         assert "WRONG" in feedback
 
     def test_mentions_correct_pairs(self):
+        """Pairs that pass should be marked CORRECT in the feedback."""
         agent = make_agent()
         task = {
             "train": [
                 {
-                    "input": np.array([[1]], dtype=np.int32),
-                    "output": np.array([[1]], dtype=np.int32),
+                    "input":  np.array([[1]], dtype=np.int32),
+                    "output": np.array([[1]], dtype=np.int32),  # identity works
                 },
                 {
-                    "input": np.array([[0]], dtype=np.int32),
-                    "output": np.array([[1]], dtype=np.int32),
+                    "input":  np.array([[0]], dtype=np.int32),
+                    "output": np.array([[1]], dtype=np.int32),  # identity fails
                 },
             ],
             "test": [],
@@ -655,6 +665,7 @@ class TestFormatErrorFeedback:
         assert "CORRECT" in feedback
 
     def test_includes_revise_instruction(self, simple_task):
+        """Feedback must ask the model to revise its answer."""
         agent = make_agent()
         eval_result = agent._evaluate_code("def transform(grid):\n    return grid", simple_task)
         feedback = agent._format_error_feedback(eval_result, attempt=1)
@@ -680,30 +691,31 @@ class TestSolve:
         assert result["n_attempts"] == 1
 
     def test_solve_retries_and_succeeds(self, simple_task):
+        """Agent should succeed after two wrong attempts followed by a correct one."""
         agent = make_agent()
-        responses = [
+        agent.client.messages.create.side_effect = [
             _mock_response(self._wrong_code()),
             _mock_response(self._wrong_code()),
             _mock_response(self._correct_code()),
         ]
-        agent.client.messages.create.side_effect = responses
         result = agent.solve(simple_task)
         assert result["success"]
         assert result["n_attempts"] == 3
 
     def test_solve_fails_after_max_retries(self, simple_task):
+        """Exhausting all retries without a correct solution should return success=False."""
         agent = make_agent()
         agent.client.messages.create.return_value = _mock_response(self._wrong_code())
         result = agent.solve(simple_task)
         assert not result["success"]
 
     def test_solve_handles_missing_code_block(self, simple_task):
+        """A response with no code block should be retried; eventual success must be detected."""
         agent = make_agent()
-        responses = [
+        agent.client.messages.create.side_effect = [
             _mock_response("I don't know"),
             _mock_response(self._correct_code()),
         ]
-        agent.client.messages.create.side_effect = responses
         result = agent.solve(simple_task)
         assert result["success"]
 
@@ -733,18 +745,18 @@ class TestSolve:
         agent = make_agent()
         agent.client.messages.create.return_value = _mock_response(self._wrong_code())
         output = agent.predict(simple_task)
-        # Wrong answer but still returns a grid (best guess)
+        # Wrong answer but still a Grid (best guess from failed code)
         assert isinstance(output, np.ndarray)
 
     def test_predict_returns_none_when_code_crashes(self, simple_task):
+        """If the best code raises on the test input, predict() must return None."""
         agent = make_agent()
         crash_code = "```python\ndef transform(grid):\n    raise RuntimeError('crash')\n```"
         agent.client.messages.create.return_value = _mock_response(crash_code)
-        output = agent.predict(simple_task)
-        assert output is None
+        assert agent.predict(simple_task) is None
 
     def test_solve_logs_timeout_and_does_not_crash(self, simple_task):
-        """A TimeoutError from the model call should be logged, not raised."""
+        """A TimeoutError from the model must be logged gracefully, not re-raised."""
         agent = make_agent()
         agent.client.messages.create.side_effect = TimeoutError("timed out")
         result = agent.solve(simple_task)
@@ -755,7 +767,7 @@ class TestSolve:
         """Code embedded inside <think> tags should be found via the raw-response fallback."""
         agent = make_agent()
         code_block = "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
-        # Entire response is inside <think>; stripping it leaves nothing
+        # The entire response is inside <think>; stripping it leaves nothing in clean_response.
         response = f"<think>Let me reason...\n{code_block}\n</think>"
         agent.client.messages.create.return_value = _mock_response(response)
         result = agent.solve(simple_task)

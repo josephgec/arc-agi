@@ -1,4 +1,10 @@
-"""Tests for arc/dsl.py."""
+"""Tests for arc/dsl.py.
+
+Each DSL primitive has its own test class.  Tests verify:
+  - correct output values / shapes
+  - immutability (all DSL functions return new arrays)
+  - edge cases (identity transforms, empty regions, etc.)
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -26,7 +32,7 @@ from arc.dsl import (
 # ---------------------------------------------------------------------------
 
 def g(*rows):
-    """Convenience: build an int32 grid from row tuples."""
+    """Build an int32 Grid from row tuples (convenience shorthand for tests)."""
     return np.array(rows, dtype=np.int32)
 
 
@@ -49,6 +55,7 @@ class TestCrop:
         np.testing.assert_array_equal(crop(grid, 1, 1, 2, 2), [[3]])
 
     def test_returns_copy(self):
+        """Mutating the result must not affect the source grid."""
         grid = g([1, 2], [3, 4])
         result = crop(grid, 0, 0, 2, 2)
         result[0, 0] = 99
@@ -76,6 +83,7 @@ class TestRotate:
         np.testing.assert_array_equal(rotate(grid, 3), expected)
 
     def test_rotate_360_identity(self):
+        """Four 90° rotations should return to the original grid."""
         grid = g([1, 2, 3], [4, 5, 6])
         np.testing.assert_array_equal(rotate(grid, 4), grid)
 
@@ -102,6 +110,7 @@ class TestFlip:
         np.testing.assert_array_equal(flip(grid, axis=1), expected)
 
     def test_flip_twice_is_identity(self):
+        """Flipping the same axis twice should restore the original."""
         grid = g([1, 2, 3], [4, 5, 6])
         np.testing.assert_array_equal(flip(flip(grid, 0), 0), grid)
 
@@ -147,6 +156,7 @@ class TestTranslate:
         assert result[0, 0] == 9
 
     def test_shift_fully_off(self):
+        """Shifting by more than the grid size should yield an all-fill grid."""
         grid = g([1, 2], [3, 4])
         result = translate(grid, 5, 0)
         np.testing.assert_array_equal(result, np.zeros_like(grid))
@@ -205,13 +215,14 @@ class TestRecolor:
         np.testing.assert_array_equal(result, expected)
 
     def test_noop_when_color_absent(self):
+        """Recoloring a colour not present in the grid should leave it unchanged."""
         grid = g([0, 1], [1, 0])
         np.testing.assert_array_equal(recolor(grid, 5, 9), grid)
 
     def test_returns_copy(self):
         grid = g([1, 2], [3, 4])
         result = recolor(grid, 1, 9)
-        assert grid[0, 0] == 1
+        assert grid[0, 0] == 1  # original unchanged
 
     def test_recolor_all(self):
         grid = np.ones((3, 3), dtype=np.int32)
@@ -231,6 +242,7 @@ class TestMask:
         np.testing.assert_array_equal(result, [[1, 0], [0, 4]])
 
     def test_mask_all_ones_identity(self):
+        """A mask of all 1s should leave the grid unchanged."""
         grid = g([1, 2], [3, 4])
         mask_grid = np.ones_like(grid)
         np.testing.assert_array_equal(mask(grid, mask_grid), grid)
@@ -249,20 +261,23 @@ class TestMask:
 
 class TestOverlay:
     def test_overlay_non_transparent(self):
+        """Non-transparent cells in top should overwrite base."""
         base = g([0, 0], [0, 0])
-        top = g([1, 0], [0, 2])
+        top  = g([1, 0], [0, 2])
         result = overlay(base, top, transparent=0)
         np.testing.assert_array_equal(result, [[1, 0], [0, 2]])
 
     def test_transparent_cells_not_painted(self):
+        """Cells in top equal to transparent_value should leave base unchanged."""
         base = g([5, 5], [5, 5])
-        top = g([0, 3], [0, 0])
+        top  = g([0, 3], [0, 0])
         result = overlay(base, top, transparent=0)
         np.testing.assert_array_equal(result, [[5, 3], [5, 5]])
 
     def test_full_overlap(self):
+        """When transparent_value cannot appear in top, all cells are overwritten."""
         base = g([1, 1], [1, 1])
-        top = g([2, 2], [2, 2])
+        top  = g([2, 2], [2, 2])
         np.testing.assert_array_equal(overlay(base, top, transparent=-1), top)
 
 
@@ -272,22 +287,26 @@ class TestOverlay:
 
 class TestFloodFill:
     def test_basic_fill(self):
+        """All-same-colour grid should be fully filled."""
         grid = g([0, 0, 0], [0, 0, 0], [0, 0, 0])
         result = flood_fill(grid, 0, 0, 5)
         assert np.all(result == 5)
 
     def test_bounded_fill(self):
+        """Fill should be blocked by cells of a different colour."""
         grid = g([1, 1, 1], [1, 0, 1], [1, 1, 1])
         result = flood_fill(grid, 1, 1, 3)
         assert result[1, 1] == 3
-        assert result[0, 0] == 1
+        assert result[0, 0] == 1  # border unchanged
 
     def test_same_color_noop(self):
+        """Filling with the same colour as the target is a no-op."""
         grid = g([1, 1], [1, 1])
         result = flood_fill(grid, 0, 0, 1)
         np.testing.assert_array_equal(result, grid)
 
     def test_does_not_cross_border(self):
+        """4-connectivity: diagonal corners must not be reached."""
         grid = g([1, 0, 1], [0, 0, 0], [1, 0, 1])
         result = flood_fill(grid, 1, 1, 9)
         assert result[0, 0] == 1  # isolated by 0s
@@ -296,7 +315,7 @@ class TestFloodFill:
     def test_returns_copy(self):
         grid = g([0, 0], [0, 0])
         result = flood_fill(grid, 0, 0, 5)
-        assert grid[0, 0] == 0
+        assert grid[0, 0] == 0  # original unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +336,7 @@ class TestFindObjects:
         assert colors == {1, 2}
 
     def test_connected_object_pixels(self):
+        """Three horizontally-connected cells should form one object."""
         grid = g([1, 1, 0], [1, 0, 0])
         objs = find_objects(grid, background=0)
         assert len(objs) == 1
@@ -331,21 +351,25 @@ class TestFindObjects:
         assert c_min == 1 and c_max == 1
 
     def test_subgrid_shape(self):
+        """Subgrid should be as small as the object's bounding box."""
         grid = g([0, 0, 0], [0, 1, 1], [0, 0, 0])
         objs = find_objects(grid, background=0)
         assert objs[0]["subgrid"].shape == (1, 2)
 
     def test_empty_grid_returns_nothing(self):
+        """A grid that is entirely background has no objects."""
         grid = np.zeros((3, 3), dtype=np.int32)
         objs = find_objects(grid, background=0)
         assert objs == []
 
     def test_infers_background(self):
+        """When background is not specified, the most frequent colour is used."""
         grid = g([0, 0, 0], [0, 1, 0], [0, 0, 0])
         objs = find_objects(grid)  # background inferred as 0
         assert len(objs) == 1
 
     def test_multicolor_each_separate(self):
+        """Each distinct non-background colour in its own cell is its own object."""
         grid = g([1, 0, 2, 0, 3])
         objs = find_objects(grid, background=0)
         assert len(objs) == 3
@@ -365,6 +389,7 @@ class TestBoundingBox:
         assert bounding_box(grid, color=1) == (1, 1, 1, 1)
 
     def test_non_background_bbox(self):
+        """Without a color argument, bounding_box covers all non-background cells."""
         grid = g([0, 0, 0], [0, 1, 1], [0, 1, 0])
         r_min, c_min, r_max, c_max = bounding_box(grid)
         assert r_min == 1
@@ -377,13 +402,14 @@ class TestBoundingBox:
 
 class TestCropToContent:
     def test_strips_padding(self):
+        """A single non-background cell surrounded by zeros → 1×1 output."""
         grid = g([0, 0, 0], [0, 1, 0], [0, 0, 0])
         result = crop_to_content(grid)
         assert result.shape == (1, 1)
         assert result[0, 0] == 1
 
     def test_no_padding(self):
-        # background=0, content fills the whole grid — crop should preserve shape
+        """Content flush against all edges should preserve the full extent."""
         grid = g([0, 1, 0], [0, 1, 0])
         result = crop_to_content(grid)
         assert result.shape == (2, 1)

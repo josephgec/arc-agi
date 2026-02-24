@@ -1,7 +1,7 @@
 """DSL of common ARC grid transformation primitives.
 
 Every function takes and returns numpy int32 arrays (Grid).
-All operations are pure (no in-place mutation).
+All operations are pure — they return a new array and never mutate the input.
 """
 from __future__ import annotations
 
@@ -15,39 +15,50 @@ from .grid import Grid, background_color
 # ---------------------------------------------------------------------------
 
 def crop(grid: Grid, r1: int, c1: int, r2: int, c2: int) -> Grid:
-    """Return sub-grid rows [r1:r2], cols [c1:c2] (exclusive end)."""
+    """Return the sub-grid at rows [r1:r2], cols [c1:c2] (exclusive end)."""
     return grid[r1:r2, c1:c2].copy()
 
 
 def rotate(grid: Grid, n: int = 1) -> Grid:
-    """Rotate 90° counter-clockwise n times."""
+    """Rotate the grid 90° counter-clockwise n times."""
     return np.rot90(grid, n).copy()
 
 
 def flip(grid: Grid, axis: int = 0) -> Grid:
-    """Flip along axis: 0 = vertical (up/down), 1 = horizontal (left/right)."""
+    """Flip the grid along an axis: 0 = vertical (up/down), 1 = horizontal (left/right)."""
     return np.flip(grid, axis=axis).copy()
 
 
 def translate(grid: Grid, dr: int, dc: int, fill: int = 0) -> Grid:
-    """Shift grid by (dr rows, dc cols), filling vacated cells with `fill`."""
+    """Shift the grid by (dr rows, dc cols), filling vacated cells with `fill`.
+
+    Positive dr shifts down; positive dc shifts right.
+    Cells that scroll off an edge are discarded (no wrapping).
+    """
     result = np.full_like(grid, fill)
     rows, cols = grid.shape
+
+    # Compute the source and destination row ranges for the copy.
+    # If dr > 0 we shift down: source starts at row 0, destination at row dr.
+    # If dr < 0 we shift up:   source starts at row -dr, destination at row 0.
     src_r = max(0, -dr), min(rows, rows - dr)
-    dst_r = max(0, dr), min(rows, rows + dr)
+    dst_r = max(0, dr),  min(rows, rows + dr)
+
+    # Same logic for columns.
     src_c = max(0, -dc), min(cols, cols - dc)
-    dst_c = max(0, dc), min(cols, cols + dc)
+    dst_c = max(0, dc),  min(cols, cols + dc)
+
     result[dst_r[0]:dst_r[1], dst_c[0]:dst_c[1]] = grid[src_r[0]:src_r[1], src_c[0]:src_c[1]]
     return result
 
 
 def scale(grid: Grid, factor: int) -> Grid:
-    """Scale up grid by integer factor (each cell → factor×factor block)."""
+    """Scale up a grid by an integer factor (each cell becomes a factor×factor block)."""
     return np.kron(grid, np.ones((factor, factor), dtype=np.int32))
 
 
 def tile(grid: Grid, n_rows: int, n_cols: int) -> Grid:
-    """Tile the grid n_rows × n_cols times."""
+    """Repeat the grid n_rows times vertically and n_cols times horizontally."""
     return np.tile(grid, (n_rows, n_cols))
 
 
@@ -56,21 +67,21 @@ def tile(grid: Grid, n_rows: int, n_cols: int) -> Grid:
 # ---------------------------------------------------------------------------
 
 def recolor(grid: Grid, from_color: int, to_color: int) -> Grid:
-    """Replace all occurrences of from_color with to_color."""
+    """Replace every occurrence of from_color with to_color."""
     result = grid.copy()
     result[result == from_color] = to_color
     return result
 
 
 def mask(grid: Grid, mask_grid: Grid, fill: int = 0) -> Grid:
-    """Zero out (fill) cells where mask_grid == 0."""
+    """Zero out (fill) cells where mask_grid == 0, keeping all other cells."""
     result = grid.copy()
     result[mask_grid == 0] = fill
     return result
 
 
 def overlay(base: Grid, top: Grid, transparent: int = 0) -> Grid:
-    """Overlay `top` onto `base`; cells where top == transparent are ignored."""
+    """Overlay `top` onto `base`, skipping cells where top == transparent."""
     result = base.copy()
     result[top != transparent] = top[top != transparent]
     return result
@@ -81,7 +92,11 @@ def overlay(base: Grid, top: Grid, transparent: int = 0) -> Grid:
 # ---------------------------------------------------------------------------
 
 def flood_fill(grid: Grid, row: int, col: int, new_color: int) -> Grid:
-    """Flood-fill starting at (row, col) replacing connected same-color cells."""
+    """Flood-fill starting at (row, col), replacing all connected same-color cells.
+
+    Uses 4-connectivity (up/down/left/right).  Returns grid unchanged if the
+    target cell already has new_color.
+    """
     result = grid.copy()
     target = int(result[row, col])
     if target == new_color:
@@ -91,6 +106,7 @@ def flood_fill(grid: Grid, row: int, col: int, new_color: int) -> Grid:
     stack = [(row, col)]
     while stack:
         r, c = stack.pop()
+        # Skip out-of-bounds or already-recolored cells
         if r < 0 or r >= rows or c < 0 or c >= cols:
             continue
         if result[r, c] != target:
@@ -105,13 +121,22 @@ def flood_fill(grid: Grid, row: int, col: int, new_color: int) -> Grid:
 # ---------------------------------------------------------------------------
 
 def find_objects(grid: Grid, background: int | None = None) -> list[dict]:
-    """Find connected objects in the grid.
+    """Find connected foreground objects in the grid.
 
-    Returns a list of dicts, each with:
-        color    — colour value
-        pixels   — list of (row, col) tuples
-        bbox     — (r_min, c_min, r_max, c_max)  (inclusive)
-        subgrid  — cropped Grid containing just this object (background=0)
+    Uses depth-first search with 4-connectivity to label connected components.
+    Cells with the background colour are ignored.
+
+    Args:
+        grid:       The input grid.
+        background: The colour to treat as background.  If None, the most
+                    frequent colour is used (see background_color()).
+
+    Returns:
+        A list of object dicts, each containing:
+            color    — colour value of the object
+            pixels   — list of (row, col) tuples for every cell in the object
+            bbox     — (r_min, c_min, r_max, c_max)  (inclusive)
+            subgrid  — smallest Grid that fits the object (background cells = 0)
     """
     if background is None:
         background = background_color(grid)
@@ -126,27 +151,29 @@ def find_objects(grid: Grid, background: int | None = None) -> list[dict]:
             if color == background or visited[r, c]:
                 continue
 
-            # BFS
-            pixels = []
-            queue = [(r, c)]
-            while queue:
-                cr, cc = queue.pop()
+            # DFS to collect all cells connected to (r, c) with the same colour
+            pixels: list[tuple[int, int]] = []
+            stack = [(r, c)]
+            while stack:
+                cr, cc = stack.pop()
                 if cr < 0 or cr >= rows or cc < 0 or cc >= cols:
                     continue
                 if visited[cr, cc] or grid[cr, cc] != color:
                     continue
                 visited[cr, cc] = True
                 pixels.append((cr, cc))
-                queue.extend([(cr + 1, cc), (cr - 1, cc), (cr, cc + 1), (cr, cc - 1)])
+                stack.extend([(cr + 1, cc), (cr - 1, cc), (cr, cc + 1), (cr, cc - 1)])
 
             if not pixels:
                 continue
 
-            rs = [p[0] for p in pixels]
-            cs_ = [p[1] for p in pixels]
-            r_min, r_max = min(rs), max(rs)
-            c_min, c_max = min(cs_), max(cs_)
+            # Compute the tight bounding box from the collected pixel coords
+            row_coords = [p[0] for p in pixels]
+            col_coords = [p[1] for p in pixels]
+            r_min, r_max = min(row_coords), max(row_coords)
+            c_min, c_max = min(col_coords), max(col_coords)
 
+            # Build a minimal subgrid containing just this object
             subgrid = np.zeros((r_max - r_min + 1, c_max - c_min + 1), dtype=np.int32)
             for pr, pc in pixels:
                 subgrid[pr - r_min, pc - c_min] = color
@@ -164,12 +191,19 @@ def find_objects(grid: Grid, background: int | None = None) -> list[dict]:
 
 
 def bounding_box(grid: Grid, color: int | None = None) -> tuple[int, int, int, int]:
-    """Return (r_min, c_min, r_max, c_max) of non-background (or specific color) cells."""
+    """Return (r_min, c_min, r_max, c_max) of non-background (or specific color) cells.
+
+    If color is given, finds the bounding box of that colour only.
+    Otherwise finds the bounding box of all non-background cells.
+    Coordinates are inclusive on both ends.
+    """
     if color is not None:
         mask_arr = grid == color
     else:
         bg = background_color(grid)
         mask_arr = grid != bg
+
+    # Collapse each axis to find which rows/cols contain a matching cell
     rows = np.any(mask_arr, axis=1)
     cols = np.any(mask_arr, axis=0)
     r_min, r_max = np.where(rows)[0][[0, -1]]
@@ -178,6 +212,6 @@ def bounding_box(grid: Grid, color: int | None = None) -> tuple[int, int, int, i
 
 
 def crop_to_content(grid: Grid) -> Grid:
-    """Crop grid to the tight bounding box of non-background content."""
+    """Crop the grid to the tight bounding box of all non-background content."""
     r_min, c_min, r_max, c_max = bounding_box(grid)
     return crop(grid, r_min, c_min, r_max + 1, c_max + 1)

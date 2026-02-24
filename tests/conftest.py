@@ -1,4 +1,4 @@
-"""Shared fixtures for ARC-AGI tests."""
+"""Shared pytest fixtures for ARC-AGI tests."""
 from __future__ import annotations
 
 import json
@@ -11,15 +11,18 @@ import pytest
 
 @pytest.fixture
 def simple_task():
-    """A minimal hand-crafted task (recolor: 1→2)."""
+    """A minimal hand-crafted task whose rule is: recolor 1 → 2.
+
+    Two training pairs so tests that check multi-pair behaviour have enough data.
+    """
     return {
         "train": [
             {
-                "input": np.array([[0, 1, 0], [1, 0, 1]], dtype=np.int32),
+                "input":  np.array([[0, 1, 0], [1, 0, 1]], dtype=np.int32),
                 "output": np.array([[0, 2, 0], [2, 0, 2]], dtype=np.int32),
             },
             {
-                "input": np.array([[1, 1, 0]], dtype=np.int32),
+                "input":  np.array([[1, 1, 0]], dtype=np.int32),
                 "output": np.array([[2, 2, 0]], dtype=np.int32),
             },
         ],
@@ -36,13 +39,16 @@ def tile_task():
     out = np.tile(inp, (2, 2))
     return {
         "train": [{"input": inp, "output": out}],
-        "test": [{"input": inp}],
+        "test":  [{"input": inp}],
     }
 
 
 @pytest.fixture
 def task_json_file(tmp_path):
-    """Write a simple task JSON to a temp file and return its path."""
+    """Write a simple recolor task to a temp JSON file and return its Path.
+
+    The file is named 'test_task.json' so that task_id == 'test_task'.
+    """
     raw = {
         "train": [
             {"input": [[0, 1], [1, 0]], "output": [[0, 2], [2, 0]]},
@@ -59,7 +65,7 @@ def task_json_file(tmp_path):
 
 @pytest.fixture
 def training_dir():
-    """Return path to the real ARC training data (skip if not present)."""
+    """Return the path to real ARC training data, skipping the test if absent."""
     p = Path(__file__).parent.parent / "data" / "data" / "training"
     if not p.exists():
         pytest.skip("ARC training data not found")
