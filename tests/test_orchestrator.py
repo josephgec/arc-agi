@@ -398,9 +398,14 @@ class TestLog:
         assert STATE_CANDIDATE in self._states(result["log"])
 
     def test_criticizing_logged_on_failure(self):
-        orch = make_orchestrator(max_retries=0)
+        # max_retries=1 → two attempts per hypothesis; Critic runs after attempt 1
+        # (not the last), so its "coder" feedback is actually used.
+        orch = make_orchestrator(max_retries=1)
         orch._hypothesizer.generate.return_value = "1. H\n2. H\n3. H"
-        orch._coder.generate.side_effect = [_wrong_code(), _correct_code(), _correct_code()]
+        orch._coder.generate.side_effect = [
+            _wrong_code(), _correct_code(),   # hyp 0: fail → critic → fix
+            _correct_code(), _correct_code(),  # hyp 1 & 2 (not reached)
+        ]
         orch._critic.analyze.return_value = _critic_coder()
 
         result = orch.solve(simple_task())
@@ -416,9 +421,13 @@ class TestLog:
         assert all("n_correct" in e for e in eval_entries)
 
     def test_criticizing_log_has_route(self):
-        orch = make_orchestrator(max_retries=0)
+        # Needs max_retries=1 so the Critic is called after a non-final attempt.
+        orch = make_orchestrator(max_retries=1)
         orch._hypothesizer.generate.return_value = "1. H\n2. H\n3. H"
-        orch._coder.generate.side_effect = [_wrong_code(), _correct_code(), _correct_code()]
+        orch._coder.generate.side_effect = [
+            _wrong_code(), _correct_code(),
+            _correct_code(), _correct_code(),
+        ]
         orch._critic.analyze.return_value = _critic_coder("specific fix")
 
         result = orch.solve(simple_task())

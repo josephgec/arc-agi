@@ -13,7 +13,14 @@ Three cognitive roles collaborate to solve ARC puzzles:
 """
 from __future__ import annotations
 
+import re
+
 from agents.llm_client import LLMClient
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>…</think> blocks emitted by reasoning models."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -140,23 +147,35 @@ Do not include any explanation, prose, or additional text outside the code block
         self._client = client
         self._system_prompt = self._SYSTEM_PROMPT_TEMPLATE.format(dsl_docs=DSL_DOCS)
 
-    def generate(self, hypothesis: str, feedback: str | None = None) -> str:
+    def generate(
+        self,
+        hypothesis: str,
+        feedback: str | None = None,
+        training_context: str | None = None,
+        temperature: float = 0.0,
+    ) -> str:
         """Return the raw model response containing a ```python code block.
 
         Args:
-            hypothesis: Natural-language transformation algorithm to implement.
-            feedback:   Optional Critic feedback from a previous failed attempt.
+            hypothesis:       Natural-language transformation algorithm to implement.
+            feedback:         Optional Critic feedback from a previous failed attempt.
+            training_context: Optional formatted training pairs shown after the
+                              hypothesis so the Coder can verify its implementation.
+            temperature:      Sampling temperature (0 = greedy; raise for retries).
         """
+        base = f"Hypothesis to implement:\n\n{hypothesis}"
+        if training_context:
+            base = f"{base}\n\n{training_context}"
         if feedback:
             content = (
-                f"Hypothesis to implement:\n\n{hypothesis}\n\n"
+                f"{base}\n\n"
                 f"--- Critic feedback from previous attempt ---\n{feedback}\n"
                 f"---\nFix the implementation based on the feedback above."
             )
         else:
-            content = f"Hypothesis to implement:\n\n{hypothesis}"
+            content = base
         messages = [{"role": "user", "content": content}]
-        return self._client.generate(self._system_prompt, messages)
+        return self._client.generate(self._system_prompt, messages, temperature=temperature)
 
 
 # ---------------------------------------------------------------------------
@@ -229,19 +248,39 @@ Immediately after the route line, write specific, actionable feedback for the ne
         return self._parse_response(response)
 
     def _parse_response(self, response: str) -> dict:
-        """Extract route and feedback from the Critic's raw response."""
-        route    = ROUTE_CODER  # safe default
-        feedback = response
+        """Extract route and feedback from the Critic's raw response.
 
-        for i, line in enumerate(response.splitlines()):
-            upper = line.strip().upper()
-            if upper == "ROUTE: HYPOTHESIZER":
-                route    = ROUTE_HYPOTHESIZER
-                feedback = "\n".join(response.splitlines()[i + 1:]).strip()
-                break
-            if upper == "ROUTE: CODER":
-                route    = ROUTE_CODER
-                feedback = "\n".join(response.splitlines()[i + 1:]).strip()
-                break
+        Strips reasoning tokens first so that <think> blocks cannot confuse
+        the route detector and are never leaked into the feedback passed to
+        the next agent.
 
-        return {"route": route, "feedback": feedback or response}
+        Feedback priority:
+          1. Text *after* the ROUTE line (the model's explicit guidance).
+          2. Text *before* the ROUTE line (the model's analysis) — used when
+             the model puts the ROUTE line last with nothing following it.
+          3. The cleaned full response as a last resort.
+        """
+        clean = _strip_thinking(response)
+        route = ROUTE_CODER   # safe default
+
+        lines         = clean.splitlines()
+        pre_route     : list[str] = []
+        post_route    : list[str] = []
+        route_found   = False
+
+        for line in lines:
+            if route_found:
+                post_route.append(line)
+            elif line.strip().upper() == "ROUTE: HYPOTHESIZER":
+                route       = ROUTE_HYPOTHESIZER
+                route_found = True
+            elif line.strip().upper() == "ROUTE: CODER":
+                route       = ROUTE_CODER
+                route_found = True
+            else:
+                pre_route.append(line)
+
+        after  = "\n".join(post_route).strip()
+        before = "\n".join(pre_route).strip()
+        feedback = after or before or clean
+        return {"route": route, "feedback": feedback}

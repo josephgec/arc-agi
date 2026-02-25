@@ -24,6 +24,7 @@ from agents.multi_agent import (
     _format_diff,
     _format_error_info,
     _format_task_description,
+    _format_training_examples,
     _parse_hypotheses,
     _strip_thinking,
 )
@@ -99,7 +100,8 @@ class Orchestrator:
         # ==============================================================
         # STATE: HYPOTHESIZING
         # ==============================================================
-        task_description = _format_task_description(task)
+        task_description   = _format_task_description(task)
+        training_examples  = _format_training_examples(task)
         try:
             hyp_response = self._hypothesizer.generate(task_description)
         except Exception as e:
@@ -118,18 +120,28 @@ class Orchestrator:
         # Outer loop: one pass per hypothesis
         # ==============================================================
         for hyp_index, hypothesis in enumerate(hypotheses):
-            coder_feedback: str | None = None
+            coder_feedback:  str | None = None
+            prev_n_correct:  int        = -1
+            no_improve_count: int       = 0
 
             # ==============================================================
             # Inner loop: Coder attempts for this hypothesis
             # ==============================================================
             for attempt in range(1, self.max_retries + 2):
+                is_last_attempt = (attempt == self.max_retries + 1)
+
+                # Temperature diversity: 0.0 on first attempt, ramp up on retries.
+                temperature = min((attempt - 1) * 0.3, 0.8)
 
                 # ----------------------------------------------------------
                 # STATE: CODING
                 # ----------------------------------------------------------
                 try:
-                    code_response = self._coder.generate(hypothesis, coder_feedback)
+                    code_response = self._coder.generate(
+                        hypothesis, coder_feedback,
+                        training_context=training_examples,
+                        temperature=temperature,
+                    )
                 except Exception as e:
                     log.append({
                         "state": STATE_CODING, "hyp_index": hyp_index,
@@ -198,6 +210,22 @@ class Orchestrator:
                         print(f"[orch] CANDIDATE  hyp={hyp_index} saved")
                     break  # hypothesis solved → move to next hypothesis
 
+                # Track consecutive non-improvement to detect a stuck hypothesis.
+                if n_correct <= prev_n_correct:
+                    no_improve_count += 1
+                else:
+                    no_improve_count = 0
+                prev_n_correct = n_correct
+
+                # Skip the Critic when it can't help: last attempt (its feedback
+                # would be discarded) or the hypothesis is clearly stuck (0 correct
+                # across multiple attempts suggests a logic flaw, not a code bug).
+                _hypothesis_stuck = (n_correct == 0 and no_improve_count >= 2)
+                if is_last_attempt or _hypothesis_stuck:
+                    if self.debug and _hypothesis_stuck:
+                        print(f"[orch] STUCK      hyp={hyp_index} — skipping Critic")
+                    break
+
                 # ----------------------------------------------------------
                 # STATE: CRITICIZING
                 # ----------------------------------------------------------
@@ -231,7 +259,6 @@ class Orchestrator:
                     break  # logic flaw → abandon hypothesis immediately
                 else:
                     # Coding bug → carry feedback into the next Coder attempt.
-                    # If this was the last attempt the loop exits naturally.
                     coder_feedback = feedback
 
         # ==============================================================

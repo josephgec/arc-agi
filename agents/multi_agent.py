@@ -69,6 +69,25 @@ def _block_analysis(inp, out) -> str | None:
     return "\n".join(lines)
 
 
+def _format_training_examples(task: dict) -> str:
+    """Format training pairs as a compact reference for the Coder.
+
+    Unlike _format_task_description (which includes the test input and is
+    written for the Hypothesizer), this is written for the Coder: it shows
+    only the training input→output pairs so the model can verify its
+    implementation mentally before returning code.
+    """
+    lines = ["Training examples (use these to verify your implementation):"]
+    for i, pair in enumerate(task["train"]):
+        inp, out = pair["input"], pair["output"]
+        ih, iw   = inp.shape
+        oh, ow   = out.shape
+        lines.append(f"Example {i + 1}: input ({ih}×{iw}) → output ({oh}×{ow})")
+        lines.append(f"  Input:  {_grid_to_str(inp)}")
+        lines.append(f"  Output: {_grid_to_str(out)}")
+    return "\n".join(lines)
+
+
 def _format_task_description(task: dict) -> str:
     """Format training pairs and test input as a grid description for the Hypothesizer."""
     pairs    = task["train"]
@@ -268,11 +287,15 @@ class MultiAgent:
         test_pair             = task.get("test", [{}])[0]
         has_test_ground_truth = "output" in test_pair
 
-        task_description: str       = _format_task_description(task)
-        hypotheses:       list[str] = []
-        hyp_index:        int       = 0
-        hyp_feedback:     str | None = None
-        coder_feedback:   str | None = None
+        task_description: str        = _format_task_description(task)
+        training_examples: str       = _format_training_examples(task)
+        hypotheses:        list[str] = []
+        hyp_index:         int       = 0
+        hyp_feedback:      str | None = None
+        coder_feedback:    str | None = None
+        prev_n_correct:    int        = -1
+        no_improve_count:  int        = 0
+        coder_attempt:     int        = 0  # Coder calls on the current hypothesis
 
         while cycle < self.max_cycles:
 
@@ -298,14 +321,30 @@ class MultiAgent:
                 if self.debug:
                     print(f"[debug] Hypothesizer: {len(hypotheses)} hypothesis(es)")
 
+            # Reset per-hypothesis attempt tracking when we switch hypothesis.
+            if not hypotheses or hyp_index == 0 or (
+                log and log[-1].get("agent") == "hypothesizer"
+            ):
+                coder_attempt    = 0
+                prev_n_correct   = -1
+                no_improve_count = 0
+
             current_hypothesis = hypotheses[hyp_index]
+            coder_attempt += 1
+
+            # Temperature diversity: greedy on first attempt, ramp up on retries.
+            temperature = min((coder_attempt - 1) * 0.3, 0.8)
 
             # --- Coder: translate hypothesis to code ---
             cycle += 1
             if cycle > self.max_cycles:
                 break
             try:
-                code_response = self._coder.generate(current_hypothesis, coder_feedback)
+                code_response = self._coder.generate(
+                    current_hypothesis, coder_feedback,
+                    training_context=training_examples,
+                    temperature=temperature,
+                )
             except Exception as e:
                 log.append({
                     "cycle": cycle, "agent": "coder",
@@ -313,6 +352,7 @@ class MultiAgent:
                 })
                 hyp_index     += 1
                 coder_feedback = None
+                coder_attempt  = 0
                 continue
 
             coder_feedback = None  # consumed; reset for next round
@@ -360,6 +400,22 @@ class MultiAgent:
                     "log":          log,
                 }
 
+            # Track whether the hypothesis is making any progress.
+            if n_correct <= prev_n_correct:
+                no_improve_count += 1
+            else:
+                no_improve_count = 0
+            prev_n_correct = n_correct
+
+            # Skip the Critic when stuck (saves a cycle and moves on faster).
+            _hypothesis_stuck = (n_correct == 0 and no_improve_count >= 2)
+            if _hypothesis_stuck:
+                if self.debug:
+                    print(f"[debug] Stuck at 0/{eval_result['n_total']} — skipping Critic, next hyp")
+                hyp_index    += 1
+                coder_attempt = 0
+                continue
+
             # --- Critic: diagnose failure ---
             cycle += 1
             if cycle > self.max_cycles:
@@ -372,7 +428,8 @@ class MultiAgent:
                 )
             except Exception as e:
                 log.append({"cycle": cycle, "agent": "critic", "error": str(e)})
-                hyp_index += 1
+                hyp_index    += 1
+                coder_attempt = 0
                 continue
 
             log.append({
@@ -385,8 +442,9 @@ class MultiAgent:
                 print(f"[debug] Critic → {critic_result['route']}")
 
             if critic_result["route"] == ROUTE_HYPOTHESIZER:
-                hyp_feedback = critic_result["feedback"]
-                hyp_index   += 1   # advance; triggers regeneration when all exhausted
+                hyp_feedback  = critic_result["feedback"]
+                hyp_index    += 1      # advance; triggers regeneration when all exhausted
+                coder_attempt = 0
             else:
                 coder_feedback = critic_result["feedback"]  # stay on same hypothesis
 
