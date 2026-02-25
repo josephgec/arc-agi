@@ -21,6 +21,7 @@ import numpy as np
 
 from arc.grid import Grid, grids_equal, COLOR_NAMES
 from arc import sandbox
+from agents.llm_client import LLMClient
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -65,12 +66,6 @@ _SYSTEM_PROMPT = textwrap.dedent("""
     - Return a NEW numpy int32 array. Never modify the input.
     - No imports, no print(), no input(), no I/O of any kind.
 """).strip()
-
-# Backend connection settings
-OLLAMA_BASE_URL   = "http://localhost:11434/v1"
-OLLAMA_CHAT_URL   = "http://localhost:11434/api/chat"
-DEFAULT_OLLAMA_MODEL    = "deepseek-r1:32b"
-DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
 # Temperature values used across retry attempts (greedy first, then exploratory).
 _TEMPERATURE_SCHEDULE = [0.0, 0.4, 0.8, 1.0]
@@ -162,23 +157,25 @@ class SingleAgent:
             timeout:     Seconds to wait for a single model call (ollama only).
             debug:       Print raw model responses to stdout for troubleshooting.
         """
-        self.backend = backend
         self.max_retries = max_retries
-        self.debug = debug
-        self._timeout = timeout
         # Per-execution wall-clock limit.  Exposed as an instance attribute so
         # tests can lower it without patching the sandbox module constant.
         self._execution_timeout = sandbox.EXECUTION_TIMEOUT
 
-        if backend == "ollama":
-            self.model = model or DEFAULT_OLLAMA_MODEL
-            self.client = None  # ollama is called via urllib; no client object needed
-        elif backend == "anthropic":
-            import anthropic
-            self.model = model or DEFAULT_ANTHROPIC_MODEL
-            self.client = anthropic.Anthropic()
-        else:
-            raise ValueError(f"Unknown backend '{backend}'. Choose 'ollama' or 'anthropic'.")
+        # All model I/O is routed through LLMClient — SingleAgent stays focused
+        # on prompt engineering and the self-correction loop.
+        self._client = LLMClient(
+            backend=backend,
+            model=model,
+            timeout=timeout,
+            debug=debug,
+        )
+
+        # Pass-through attributes so callers/tests can inspect backend & model
+        # without reaching into the private _client.
+        self.backend = self._client.backend
+        self.model   = self._client.model
+        self.debug   = self._client.debug
 
     # ------------------------------------------------------------------
     # Public API
@@ -226,7 +223,7 @@ class SingleAgent:
 
             # --- Call the model ---
             try:
-                response_text = self._call_model(messages, temperature=temperature)
+                response_text = self._client.generate(_SYSTEM_PROMPT, messages, temperature)
             except TimeoutError as e:
                 log.append({"attempt": attempt, "error": f"timeout: {e}", "n_correct": 0})
                 break
@@ -517,145 +514,3 @@ class SingleAgent:
         """Run the generated code against all training pairs via arc.sandbox."""
         return sandbox.evaluate_code(code, task, self._execution_timeout)
 
-    # ------------------------------------------------------------------
-    # Model API (backend-agnostic routing)
-    # ------------------------------------------------------------------
-
-    def _call_model(self, messages: list[dict], temperature: float = 0.0) -> str:
-        """Route a model call to the configured backend and return the response text."""
-        if self.backend == "anthropic":
-            return self._call_anthropic(messages)
-        return self._call_ollama(messages, temperature=temperature)
-
-    def _call_anthropic(self, messages: list[dict]) -> str:
-        """Send a chat request to the Anthropic API and return the response text."""
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8192,
-            system=_SYSTEM_PROMPT,
-            messages=messages,
-        )
-        return response.content[0].text
-
-    def _call_ollama(self, messages: list[dict], temperature: float = 0.0) -> str:
-        """Send a streaming chat request to the local Ollama server.
-
-        Streams the NDJSON response line-by-line so we can:
-          - exit early once a complete code block is detected *outside* any
-            <think> block (saves time without cutting off the final answer), and
-          - recover partial results if the wall-clock deadline is reached.
-
-        Thinking tokens (from extended-thinking models like deepseek-r1) are
-        collected separately and wrapped in <think>…</think> tags so that
-        _strip_thinking() can remove them uniformly.
-
-        Early-exit is deliberately suppressed while a <think> block is still
-        open: reasoning models write draft code inside <think> before emitting
-        their final answer; breaking there would leave the closing </think>
-        tag missing, causing _strip_thinking() to fail and the agent to execute
-        the draft code instead of the final one.
-
-        Raises TimeoutError if the server never responds at all.
-        """
-        import json
-        import socket
-        import time
-        import urllib.error
-        import urllib.request
-
-        full_messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + messages
-        payload = json.dumps({
-            "model":   self.model,
-            "messages": full_messages,
-            "stream":  True,  # streaming lets us exit early and recover partials
-            "options": {
-                "temperature": temperature,
-                "num_predict": 32000,  # token budget; at ~40 tok/s ≈ 800 s max
-            },
-        }).encode()
-
-        req = urllib.request.Request(
-            OLLAMA_CHAT_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        thinking_parts: list[str] = []
-        content_parts:  list[str] = []
-
-        # Per-read socket timeout: shorter than the overall deadline so we can
-        # check wall-clock time between individual chunk reads.
-        _READ_TIMEOUT = min(self._timeout, 60)
-        deadline = time.monotonic() + self._timeout
-
-        try:
-            with urllib.request.urlopen(req, timeout=_READ_TIMEOUT) as resp:
-                for raw_line in resp:
-                    try:
-                        chunk = json.loads(raw_line.strip())
-                    except (json.JSONDecodeError, ValueError):
-                        continue  # skip malformed lines
-
-                    msg = chunk.get("message", {})
-                    thinking_parts.append(msg.get("thinking") or "")
-                    content_parts.append(msg.get("content") or "")
-
-                    if chunk.get("done"):
-                        break  # server signalled completion
-
-                    # Early-exit: a complete code block is present *outside*
-                    # any <think> block.
-                    #
-                    # Reasoning models (deepseek-r1, qwen3) routinely write
-                    # draft code inside <think>…</think> before producing their
-                    # final answer.  If we break on the first code block we see,
-                    # </think> may never arrive, _strip_thinking() won't match,
-                    # and we execute the unrefined draft instead of the final
-                    # answer.  The fix: strip completed <think> blocks first,
-                    # then only exit if the remaining content has a code block
-                    # AND no <think> is still open.
-                    content_so_far = "".join(content_parts)
-                    content_outside_think = re.sub(
-                        r"<think>.*?</think>", "", content_so_far, flags=re.DOTALL
-                    )
-                    think_still_open = "<think>" in content_outside_think
-                    if (
-                        not think_still_open
-                        and content_outside_think.count("```") >= 2
-                        and "def " in content_outside_think
-                        and re.search(
-                            r"```(?:python)?\s.*?```",
-                            content_outside_think,
-                            re.DOTALL | re.IGNORECASE,
-                        )
-                    ):
-                        break
-
-                    # Deadline check: stop reading if wall-clock time is up.
-                    if time.monotonic() > deadline:
-                        break
-
-        except socket.timeout as e:
-            # Per-read timeout fired.  If we received nothing, it's a hard failure.
-            if not thinking_parts and not content_parts:
-                raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
-        except urllib.error.URLError as e:
-            if isinstance(e.reason, socket.timeout):
-                if not thinking_parts and not content_parts:
-                    raise TimeoutError(f"Ollama call timed out after {self._timeout}s") from e
-            else:
-                raise
-
-        thinking = "".join(thinking_parts)
-        content  = "".join(content_parts)
-
-        if self.debug:
-            print(f"[debug] content length={len(content)}  thinking length={len(thinking)}")
-
-        # Reassemble thinking + content so _strip_thinking() handles it uniformly
-        if thinking and content:
-            return f"<think>{thinking}</think>\n{content}"
-        if thinking:
-            return f"<think>{thinking}</think>"
-        return content

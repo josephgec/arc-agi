@@ -1,0 +1,212 @@
+"""LLM backend abstraction for the ARC-AGI multi-agent framework.
+
+Any agent (Analyst, Coder, Critic, …) instantiates LLMClient and calls
+generate() to get a completion.  All network and SDK details are hidden
+behind that single method so agents stay focused on reasoning, not I/O.
+
+Supported backends
+------------------
+  "ollama"    — local Ollama server via urllib streaming NDJSON (no API cost)
+  "anthropic" — Anthropic cloud API via the `anthropic` SDK
+
+Thinking tokens
+---------------
+deepseek-r1 and similar models emit reasoning via a separate `thinking`
+field in Ollama's NDJSON stream.  generate() collects those tokens,
+wraps them in <think>…</think>, and prepends them to the content so that
+callers can strip them uniformly with a single regex.
+"""
+from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# Connection constants
+# ---------------------------------------------------------------------------
+
+OLLAMA_CHAT_URL       = "http://localhost:11434/api/chat"
+DEFAULT_OLLAMA_MODEL  = "deepseek-r1:32b"
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+
+# ---------------------------------------------------------------------------
+# LLMClient
+# ---------------------------------------------------------------------------
+
+class LLMClient:
+    """Thin, backend-agnostic wrapper around LLM completion APIs.
+
+    Agents call generate() with a system prompt, a conversation history,
+    and a temperature.  The client routes to the configured backend and
+    returns raw response text (including any <think> tags from reasoning
+    models).
+
+    Args:
+        backend:  "ollama" or "anthropic".
+        model:    Model name override.  Defaults to deepseek-r1:32b /
+                  claude-sonnet-4-6 depending on backend.
+        timeout:  Seconds to wait for a model response (Ollama only).
+        debug:    Print response length diagnostics to stdout.
+    """
+
+    def __init__(
+        self,
+        backend: str = "ollama",
+        model: str | None = None,
+        timeout: float = 120.0,
+        debug: bool = False,
+    ) -> None:
+        self.debug    = debug
+        self._timeout = timeout
+
+        if backend == "ollama":
+            self.backend = "ollama"
+            self.model   = model or DEFAULT_OLLAMA_MODEL
+            self._anthropic = None
+        elif backend == "anthropic":
+            import anthropic
+            self.backend    = "anthropic"
+            self.model      = model or DEFAULT_ANTHROPIC_MODEL
+            self._anthropic = anthropic.Anthropic()
+        else:
+            raise ValueError(
+                f"Unknown backend '{backend}'. Choose 'ollama' or 'anthropic'."
+            )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        temperature: float = 0.0,
+    ) -> str:
+        """Request a completion and return the response text.
+
+        Args:
+            system_prompt: The system instruction prepended to every request.
+            messages:      Conversation history in OpenAI-style role/content dicts.
+            temperature:   Sampling temperature (0 = greedy).
+
+        Returns:
+            Raw response text.  Thinking tokens from reasoning models are
+            wrapped in <think>…</think> so callers can strip them uniformly.
+
+        Raises:
+            TimeoutError: Ollama backend only — server never responded.
+        """
+        if self.backend == "anthropic":
+            return self._call_anthropic(system_prompt, messages)
+        return self._call_ollama(system_prompt, messages, temperature)
+
+    # ------------------------------------------------------------------
+    # Private backends
+    # ------------------------------------------------------------------
+
+    def _call_anthropic(self, system_prompt: str, messages: list[dict]) -> str:
+        """Send a request to the Anthropic API and return the response text."""
+        response = self._anthropic.messages.create(
+            model=self.model,
+            max_tokens=8192,
+            system=system_prompt,
+            messages=messages,
+        )
+        return response.content[0].text
+
+    def _call_ollama(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        temperature: float,
+    ) -> str:
+        """Send a streaming chat request to the local Ollama server.
+
+        Streams NDJSON line-by-line, accumulating content and thinking tokens
+        until the server signals done=True or the wall-clock deadline fires.
+        Partial results are returned on deadline rather than raising an error,
+        so the agent can still attempt code extraction from whatever arrived.
+
+        Thinking tokens (deepseek-r1, qwen3, etc.) arrive in the `thinking`
+        field of each chunk and are wrapped in <think>…</think> on return so
+        callers can strip them with a single regex.
+
+        Note: no early-exit on code-block detection.  Reasoning models write
+        draft code inside <think> blocks before producing their final answer;
+        stopping early risks capturing the draft instead of the real solution.
+
+        Raises:
+            TimeoutError: if the server never responds at all (empty result).
+        """
+        import json
+        import socket
+        import time
+        import urllib.error
+        import urllib.request
+
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        payload = json.dumps({
+            "model":    self.model,
+            "messages": full_messages,
+            "stream":   True,
+            "options":  {
+                "temperature": temperature,
+                "num_predict": 32000,
+            },
+        }).encode()
+
+        req = urllib.request.Request(
+            OLLAMA_CHAT_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        thinking_parts: list[str] = []
+        content_parts:  list[str] = []
+
+        _READ_TIMEOUT = min(self._timeout, 60)
+        deadline      = time.monotonic() + self._timeout
+
+        try:
+            with urllib.request.urlopen(req, timeout=_READ_TIMEOUT) as resp:
+                for raw_line in resp:
+                    try:
+                        chunk = json.loads(raw_line.strip())
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+                    msg = chunk.get("message", {})
+                    thinking_parts.append(msg.get("thinking") or "")
+                    content_parts.append(msg.get("content") or "")
+
+                    if chunk.get("done"):
+                        break
+
+                    if time.monotonic() > deadline:
+                        break
+
+        except socket.timeout as e:
+            if not thinking_parts and not content_parts:
+                raise TimeoutError(
+                    f"Ollama call timed out after {self._timeout}s"
+                ) from e
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, socket.timeout):
+                if not thinking_parts and not content_parts:
+                    raise TimeoutError(
+                        f"Ollama call timed out after {self._timeout}s"
+                    ) from e
+            else:
+                raise
+
+        thinking = "".join(thinking_parts)
+        content  = "".join(content_parts)
+
+        if self.debug:
+            print(f"[debug] content={len(content)} chars  thinking={len(thinking)} chars")
+
+        if thinking and content:
+            return f"<think>{thinking}</think>\n{content}"
+        if thinking:
+            return f"<think>{thinking}</think>"
+        return content

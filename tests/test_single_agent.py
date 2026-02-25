@@ -4,7 +4,6 @@ The Anthropic API and urllib are mocked throughout so no network calls are made.
 """
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -18,46 +17,16 @@ from agents.single_agent import SingleAgent, _grid_to_str, _diff_summary, _strip
 # ---------------------------------------------------------------------------
 
 def make_agent() -> SingleAgent:
-    """Return a SingleAgent backed by a mocked Anthropic client."""
+    """Return a SingleAgent whose LLMClient.generate is a MagicMock.
+
+    Mocking at the generate() boundary keeps tests focused on agent behaviour
+    (prompt building, code extraction, self-correction loop) rather than on
+    network or SDK plumbing, which is covered by test_llm_client.py.
+    """
     with patch("anthropic.Anthropic"):
         agent = SingleAgent(backend="anthropic", model="claude-sonnet-4-6", max_retries=2)
-    agent.client = MagicMock()
+    agent._client.generate = MagicMock()
     return agent
-
-
-def _mock_response(text: str) -> MagicMock:
-    """Build a mock object that mimics an Anthropic API response."""
-    msg = MagicMock()
-    msg.content = [MagicMock(text=text)]
-    return msg
-
-
-def _ollama_ctx(content: str = "", thinking: str = "") -> MagicMock:
-    """Return a context-manager mock for urllib.request.urlopen (streaming NDJSON).
-
-    The mock yields NDJSON lines that mirror Ollama's streaming chat format:
-    - Optional thinking chunk (if thinking is non-empty)
-    - Optional content chunk (if content is non-empty)
-    - A final done=True chunk
-    """
-    lines: list[bytes] = []
-    if thinking:
-        lines.append(
-            json.dumps({"message": {"content": "", "thinking": thinking}, "done": False}).encode() + b"\n"
-        )
-    if content:
-        lines.append(
-            json.dumps({"message": {"content": content, "thinking": ""}, "done": False}).encode() + b"\n"
-        )
-    lines.append(
-        json.dumps({"message": {"content": "", "thinking": ""}, "done": True}).encode() + b"\n"
-    )
-
-    cm = MagicMock()
-    cm.__enter__ = MagicMock(return_value=cm)
-    cm.__exit__ = MagicMock(return_value=False)
-    cm.__iter__ = lambda self: iter(lines)
-    return cm
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +63,6 @@ class TestSingleAgentInit:
         assert agent.backend == "ollama"
         assert "deepseek" in agent.model
 
-    def test_ollama_client_is_none(self):
-        """Ollama uses urllib directly; no SDK client object is needed."""
-        agent = SingleAgent(backend="ollama")
-        assert agent.client is None
-
     def test_anthropic_backend(self):
         with patch("anthropic.Anthropic"):
             agent = SingleAgent(backend="anthropic")
@@ -113,9 +77,11 @@ class TestSingleAgentInit:
         with pytest.raises(ValueError, match="Unknown backend"):
             SingleAgent(backend="invalid")
 
-    def test_timeout_stored(self):
-        agent = SingleAgent(backend="ollama", timeout=42.0)
-        assert agent._timeout == 42.0
+    def test_llm_client_created(self):
+        """SingleAgent must delegate model I/O to an LLMClient instance."""
+        from agents.llm_client import LLMClient
+        agent = SingleAgent(backend="ollama")
+        assert isinstance(agent._client, LLMClient)
 
     def test_debug_flag_stored(self):
         agent = SingleAgent(backend="ollama", debug=True)
@@ -436,175 +402,6 @@ class TestBlockAnalysis:
 
 
 # ---------------------------------------------------------------------------
-# _call_ollama — streaming Ollama API (urllib mocked)
-# ---------------------------------------------------------------------------
-
-def _ollama_chunks(*content_pieces: str, thinking: str = "") -> MagicMock:
-    """Build a streaming mock that yields one chunk per content piece.
-
-    Unlike _ollama_ctx (which puts everything in one or two chunks), this
-    helper lets tests send content incrementally — essential for verifying
-    early-exit behaviour mid-stream.
-    """
-    lines: list[bytes] = []
-    if thinking:
-        lines.append(
-            json.dumps({"message": {"content": "", "thinking": thinking}, "done": False}).encode() + b"\n"
-        )
-    for piece in content_pieces:
-        lines.append(
-            json.dumps({"message": {"content": piece, "thinking": ""}, "done": False}).encode() + b"\n"
-        )
-    lines.append(
-        json.dumps({"message": {"content": "", "thinking": ""}, "done": True}).encode() + b"\n"
-    )
-    cm = MagicMock()
-    cm.__enter__ = MagicMock(return_value=cm)
-    cm.__exit__  = MagicMock(return_value=False)
-    cm.__iter__  = lambda self: iter(lines)
-    return cm
-
-
-class TestCallOllama:
-    def _agent(self) -> SingleAgent:
-        return SingleAgent(backend="ollama", timeout=10.0)
-
-    def test_content_returned_directly(self):
-        agent = self._agent()
-        with patch("urllib.request.urlopen", return_value=_ollama_ctx(content="Hello")):
-            result = agent._call_ollama([{"role": "user", "content": "hi"}])
-        assert result == "Hello"
-
-    def test_thinking_only_wrapped_in_tags(self):
-        """Thinking-only responses should be wrapped in <think> tags."""
-        agent = self._agent()
-        with patch("urllib.request.urlopen", return_value=_ollama_ctx(thinking="I reasoned")):
-            result = agent._call_ollama([{"role": "user", "content": "hi"}])
-        assert result == "<think>I reasoned</think>"
-
-    def test_thinking_and_content_combined(self):
-        """Responses with both thinking and content should include both parts."""
-        agent = self._agent()
-        with patch("urllib.request.urlopen", return_value=_ollama_ctx(content="Answer", thinking="reasoning")):
-            result = agent._call_ollama([{"role": "user", "content": "hi"}])
-        assert "<think>reasoning</think>" in result
-        assert "Answer" in result
-
-    def test_empty_response_returns_empty_string(self):
-        agent = self._agent()
-        with patch("urllib.request.urlopen", return_value=_ollama_ctx()):
-            result = agent._call_ollama([{"role": "user", "content": "hi"}])
-        assert result == ""
-
-    def test_timeout_raises_timeout_error(self):
-        """A socket.timeout with no partial data must be re-raised as TimeoutError."""
-        import socket
-        agent = self._agent()
-        with patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")):
-            with pytest.raises(TimeoutError):
-                agent._call_ollama([{"role": "user", "content": "hi"}])
-
-    def test_partial_result_returned_on_deadline(self):
-        """When the wall-clock deadline fires mid-stream, partial data is returned."""
-        import time
-        agent = SingleAgent(backend="ollama", timeout=0.001)  # nearly-zero deadline
-
-        thinking_chunk = (
-            json.dumps({"message": {"content": "", "thinking": "partial thinking"}, "done": False}).encode()
-            + b"\n"
-        )
-        done_chunk = (
-            json.dumps({"message": {"content": "", "thinking": ""}, "done": True}).encode()
-            + b"\n"
-        )
-
-        cm = MagicMock()
-        cm.__enter__ = MagicMock(return_value=cm)
-        cm.__exit__  = MagicMock(return_value=False)
-
-        def slow_iter():
-            yield thinking_chunk
-            time.sleep(0.01)  # sleep past the 0.001s deadline
-            yield done_chunk
-
-        cm.__iter__ = lambda self: slow_iter()
-
-        with patch("urllib.request.urlopen", return_value=cm):
-            result = agent._call_ollama([{"role": "user", "content": "hi"}])
-
-        # Should return partial thinking rather than raise TimeoutError
-        assert "partial thinking" in result
-
-    # ------------------------------------------------------------------
-    # Early-exit / <think> interaction tests
-    # ------------------------------------------------------------------
-
-    def test_no_early_exit_while_think_block_open(self):
-        """Draft code inside an unclosed <think> block must not trigger early-exit.
-
-        The stream must continue so that </think> arrives and the final answer
-        (after the closing tag) is captured.
-        """
-        agent = self._agent()
-        draft  = "<think>\n```python\ndef transform(grid):\n    return grid * 0\n```\nLet me reconsider...\n"
-        final  = "</think>\n```python\ndef transform(grid):\n    return grid.copy()\n```"
-
-        with patch("urllib.request.urlopen", return_value=_ollama_chunks(draft, final)):
-            result = agent._call_ollama([{"role": "user", "content": "hi"}])
-
-        # The full content (both pieces) must be returned
-        assert "return grid * 0"   in result   # draft present in raw output
-        assert "return grid.copy()" in result  # final answer also present
-
-    def test_strip_thinking_removes_draft_leaving_final(self):
-        """After _call_ollama returns, _strip_thinking must expose only the final code.
-
-        This is the end-to-end fix: draft inside <think> is stripped; only the
-        real answer after </think> is available for code extraction.
-        """
-        agent = self._agent()
-        draft  = "<think>\n```python\ndef transform(grid):\n    return grid * 0\n```\n</think>\n"
-        final  = "```python\ndef transform(grid):\n    return grid.copy()\n```"
-
-        with patch("urllib.request.urlopen", return_value=_ollama_chunks(draft, final)):
-            raw = agent._call_ollama([{"role": "user", "content": "hi"}])
-
-        cleaned = _strip_thinking(raw)
-        assert "return grid * 0"    not in cleaned  # draft stripped
-        assert "return grid.copy()" in cleaned       # final answer kept
-
-    def test_early_exit_fires_on_final_code_after_closed_think(self):
-        """Early-exit IS allowed once </think> has closed and final code is complete."""
-        agent = self._agent()
-        thinking_and_final = (
-            "<think>some reasoning</think>\n"
-            "```python\ndef transform(grid):\n    return grid.copy()\n```"
-        )
-        trailing_prose = "Here is why this works..."  # should never arrive
-
-        with patch("urllib.request.urlopen",
-                   return_value=_ollama_chunks(thinking_and_final, trailing_prose)):
-            result = agent._call_ollama([{"role": "user", "content": "hi"}])
-
-        # Early-exit fired before trailing_prose was consumed
-        assert "trailing_prose" not in result
-        assert "return grid.copy()" in result
-
-    def test_early_exit_fires_normally_when_no_think_tags(self):
-        """Without any <think> tags, early-exit should still work as before."""
-        agent = self._agent()
-        code_chunk    = "```python\ndef transform(grid):\n    return grid.copy()\n```"
-        trailing_text = " extra text that should be cut off"
-
-        with patch("urllib.request.urlopen",
-                   return_value=_ollama_chunks(code_chunk, trailing_text)):
-            result = agent._call_ollama([{"role": "user", "content": "hi"}])
-
-        assert "return grid.copy()" in result
-        assert "extra text" not in result
-
-
-# ---------------------------------------------------------------------------
 # _execute
 # ---------------------------------------------------------------------------
 
@@ -777,7 +574,7 @@ class TestEvaluateTest:
         """solve() must set test_correct=True when best code passes the test pair."""
         agent = make_agent()
         task = self._task_with_test_output(correct=True)
-        agent.client.messages.create.return_value = _mock_response(
+        agent._client.generate.return_value = (
             "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
         )
         result = agent.solve(task)
@@ -800,7 +597,7 @@ class TestEvaluateTest:
             "    return grid.copy()  # wrong for all other inputs\n"
             "```"
         )
-        agent.client.messages.create.return_value = _mock_response(overfit_code)
+        agent._client.generate.return_value = overfit_code
         result = agent.solve(task)
         # Training passes (the hardcoded answer matches), but test fails
         assert result["success"] is True
@@ -809,7 +606,7 @@ class TestEvaluateTest:
     def test_solve_returns_test_correct_none_when_no_ground_truth(self, simple_task):
         """simple_task has no test output — test_correct must be None."""
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(
+        agent._client.generate.return_value = (
             "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
         )
         result = agent.solve(simple_task)
@@ -821,7 +618,7 @@ class TestEvaluateTest:
         task = self._task_with_test_output(correct=True)
         # Correct code for the test but deliberately wrong for training
         # (training pair expects [[2]] but we return [[1]])
-        agent.client.messages.create.return_value = _mock_response(
+        agent._client.generate.return_value = (
             "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
         )
         # Force all training pairs to fail by making training output something else
@@ -916,7 +713,7 @@ class TestSolve:
 
     def test_solve_succeeds_on_first_try(self, simple_task):
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(self._correct_code())
+        agent._client.generate.return_value = self._correct_code()
         result = agent.solve(simple_task)
         assert result["success"]
         assert result["n_attempts"] == 1
@@ -924,10 +721,10 @@ class TestSolve:
     def test_solve_retries_and_succeeds(self, simple_task):
         """Agent should succeed after two wrong attempts followed by a correct one."""
         agent = make_agent()
-        agent.client.messages.create.side_effect = [
-            _mock_response(self._wrong_code()),
-            _mock_response(self._wrong_code()),
-            _mock_response(self._correct_code()),
+        agent._client.generate.side_effect = [
+            self._wrong_code(),
+            self._wrong_code(),
+            self._correct_code(),
         ]
         result = agent.solve(simple_task)
         assert result["success"]
@@ -936,16 +733,16 @@ class TestSolve:
     def test_solve_fails_after_max_retries(self, simple_task):
         """Exhausting all retries without a correct solution should return success=False."""
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(self._wrong_code())
+        agent._client.generate.return_value = self._wrong_code()
         result = agent.solve(simple_task)
         assert not result["success"]
 
     def test_solve_handles_missing_code_block(self, simple_task):
         """A response with no code block should be retried; eventual success must be detected."""
         agent = make_agent()
-        agent.client.messages.create.side_effect = [
-            _mock_response("I don't know"),
-            _mock_response(self._correct_code()),
+        agent._client.generate.side_effect = [
+            "I don't know",
+            self._correct_code(),
         ]
         result = agent.solve(simple_task)
         assert result["success"]
@@ -953,27 +750,27 @@ class TestSolve:
     def test_solve_result_always_has_test_correct_key(self, simple_task):
         """test_correct must always be present in the result dict."""
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(self._correct_code())
+        agent._client.generate.return_value = self._correct_code()
         result = agent.solve(simple_task)
         assert "test_correct" in result
 
     def test_solve_returns_log(self, simple_task):
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(self._correct_code())
+        agent._client.generate.return_value = self._correct_code()
         result = agent.solve(simple_task)
         assert isinstance(result["log"], list)
         assert len(result["log"]) >= 1
 
     def test_solve_returns_code(self, simple_task):
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(self._correct_code())
+        agent._client.generate.return_value = self._correct_code()
         result = agent.solve(simple_task)
         assert result["code"] is not None
         assert "def transform" in result["code"]
 
     def test_predict_returns_grid(self, simple_task):
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(self._correct_code())
+        agent._client.generate.return_value = self._correct_code()
         output = agent.predict(simple_task)
         assert output is not None
         assert isinstance(output, np.ndarray)
@@ -981,7 +778,7 @@ class TestSolve:
     def test_predict_returns_best_guess_on_failure(self, simple_task):
         """predict() returns the best-effort output even when solve() fails."""
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(self._wrong_code())
+        agent._client.generate.return_value = self._wrong_code()
         output = agent.predict(simple_task)
         # Wrong answer but still a Grid (best guess from failed code)
         assert isinstance(output, np.ndarray)
@@ -990,13 +787,13 @@ class TestSolve:
         """If the best code raises on the test input, predict() must return None."""
         agent = make_agent()
         crash_code = "```python\ndef transform(grid):\n    raise RuntimeError('crash')\n```"
-        agent.client.messages.create.return_value = _mock_response(crash_code)
+        agent._client.generate.return_value = crash_code
         assert agent.predict(simple_task) is None
 
     def test_solve_logs_timeout_and_does_not_crash(self, simple_task):
         """A TimeoutError from the model must be logged gracefully, not re-raised."""
         agent = make_agent()
-        agent.client.messages.create.side_effect = TimeoutError("timed out")
+        agent._client.generate.side_effect = TimeoutError("timed out")
         result = agent.solve(simple_task)
         assert not result["success"]
         assert any("timeout" in str(e.get("error", "")) for e in result["log"])
@@ -1007,7 +804,7 @@ class TestSolve:
         code_block = "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
         # The entire response is inside <think>; stripping it leaves nothing in clean_response.
         response = f"<think>Let me reason...\n{code_block}\n</think>"
-        agent.client.messages.create.return_value = _mock_response(response)
+        agent._client.generate.return_value = response
         result = agent.solve(simple_task)
         assert result["success"]
 
@@ -1020,7 +817,7 @@ class TestSolve:
         """
         import json
         agent = make_agent()
-        agent.client.messages.create.return_value = _mock_response(self._wrong_code())
+        agent._client.generate.return_value = self._wrong_code()
         result = agent.solve(simple_task)
         # Must not raise
         serialised = json.dumps(result["log"])
