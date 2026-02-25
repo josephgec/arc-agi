@@ -725,9 +725,9 @@ class TestExecute:
 
     def test_execution_timeout_attribute_set(self):
         """_execution_timeout must be set from the module-level constant."""
-        from agents.single_agent import _EXECUTION_TIMEOUT
+        from arc.sandbox import EXECUTION_TIMEOUT
         agent = make_agent()
-        assert agent._execution_timeout == _EXECUTION_TIMEOUT
+        assert agent._execution_timeout == EXECUTION_TIMEOUT
 
 
 # ---------------------------------------------------------------------------

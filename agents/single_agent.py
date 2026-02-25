@@ -16,41 +16,15 @@ from __future__ import annotations
 
 import re
 import textwrap
-import traceback
-from typing import Any
 
 import numpy as np
 
 from arc.grid import Grid, grids_equal, COLOR_NAMES
-from arc.dsl import (
-    crop, rotate, flip, translate, scale, tile,
-    recolor, mask, overlay, flood_fill,
-    find_objects, bounding_box, crop_to_content,
-)
+from arc import sandbox
 
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
-
-# DSL functions and numpy injected into every generated function's exec scope.
-# The model can use these without any imports.
-_DSL_NAMESPACE: dict[str, Any] = {
-    "np":              np,
-    "numpy":           np,
-    "crop":            crop,
-    "rotate":          rotate,
-    "flip":            flip,
-    "translate":       translate,
-    "scale":           scale,
-    "tile":            tile,
-    "recolor":         recolor,
-    "mask":            mask,
-    "overlay":         overlay,
-    "flood_fill":      flood_fill,
-    "find_objects":    find_objects,
-    "bounding_box":    bounding_box,
-    "crop_to_content": crop_to_content,
-}
 
 # System prompt sent to the model at the start of every conversation.
 _SYSTEM_PROMPT = textwrap.dedent("""
@@ -101,10 +75,6 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 # Temperature values used across retry attempts (greedy first, then exploratory).
 _TEMPERATURE_SCHEDULE = [0.0, 0.4, 0.8, 1.0]
 
-# Hard wall-clock limit for executing generated code.  Kills any runaway
-# infinite loop before it can freeze the parent process.
-_EXECUTION_TIMEOUT = 10.0  # seconds
-
 
 # ---------------------------------------------------------------------------
 # Module-level helper functions (pure, no model I/O)
@@ -154,63 +124,6 @@ def _diff_summary(expected: Grid, predicted: Grid, max_show: int = 12) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess worker for sandboxed code execution
-# ---------------------------------------------------------------------------
-
-def _subprocess_run(code: str, grid_list: list, out_queue) -> None:
-    """Execute generated code inside a child process and put the result in out_queue.
-
-    Must be a module-level function so it is picklable when multiprocessing
-    uses the 'spawn' start method (default on macOS / Windows).
-
-    Puts exactly one item into out_queue:
-        ("ok",    result_list)   — success; result_list is grid.tolist()
-        ("error", message: str)  — any failure (compile, runtime, missing fn)
-    """
-    import io
-    import contextlib
-    import traceback
-    import numpy as np
-
-    # Rebuild the DSL namespace in this process (required with spawn start method)
-    namespace = dict(_DSL_NAMESPACE)
-
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            exec(code, namespace)  # noqa: S102
-    except Exception as e:
-        out_queue.put(("error", f"Compile error: {type(e).__name__}: {e}"))
-        return
-
-    # Prefer a function literally named "transform"; fall back to any
-    # user-defined callable (models sometimes use different names).
-    transform_fn = namespace.get("transform")
-    if transform_fn is None:
-        user_fns = [
-            v for k, v in namespace.items()
-            if callable(v)
-            and k not in _DSL_NAMESPACE
-            and not k.startswith("_")
-            and k != "__builtins__"
-        ]
-        if user_fns:
-            transform_fn = user_fns[-1]
-        else:
-            out_queue.put(("error", "No `transform` function found in generated code."))
-            return
-
-    input_grid = np.array(grid_list, dtype=np.int32)
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = transform_fn(input_grid.copy())
-        if not isinstance(result, np.ndarray):
-            result = np.array(result, dtype=np.int32)
-        out_queue.put(("ok", result.astype(np.int32).tolist()))
-    except Exception as e:
-        out_queue.put(("error", f"Runtime error: {type(e).__name__}: {e}\n{traceback.format_exc()}"))
-
-
-# ---------------------------------------------------------------------------
 # SingleAgent
 # ---------------------------------------------------------------------------
 
@@ -254,8 +167,8 @@ class SingleAgent:
         self.debug = debug
         self._timeout = timeout
         # Per-execution wall-clock limit.  Exposed as an instance attribute so
-        # tests can lower it without patching the module-level constant.
-        self._execution_timeout = _EXECUTION_TIMEOUT
+        # tests can lower it without patching the sandbox module constant.
+        self._execution_timeout = sandbox.EXECUTION_TIMEOUT
 
         if backend == "ollama":
             self.model = model or DEFAULT_OLLAMA_MODEL
@@ -582,52 +495,8 @@ class SingleAgent:
         return None
 
     def _execute(self, code: str, input_grid: Grid) -> tuple[Grid | None, str | None]:
-        """Execute generated code in a subprocess with a hard timeout.
-
-        Spawns a child process to run the code so that an infinite loop (or any
-        other runaway computation) cannot freeze the parent.  The child is
-        forcibly killed if it has not finished within self._execution_timeout
-        seconds.
-
-        The code runs in an isolated namespace seeded with the DSL and numpy.
-        stdout inside the child is suppressed.
-
-        Returns a (result_grid, error_message) tuple — exactly one will be None.
-        """
-        import multiprocessing as mp
-
-        # Quick guard before paying the subprocess-spawn cost.  stdin access
-        # indicates a model misunderstanding — reject it immediately.
-        if "input(" in code or "sys.stdin" in code:
-            return None, "Code uses input()/stdin — not allowed; grid is passed as argument."
-
-        # Pass the grid as a plain Python list so it is picklable across all
-        # multiprocessing start methods (fork, spawn, forkserver).
-        out_queue: mp.Queue = mp.Queue()
-        proc = mp.Process(
-            target=_subprocess_run,
-            args=(code, input_grid.tolist(), out_queue),
-        )
-        proc.start()
-        proc.join(timeout=self._execution_timeout)
-
-        if proc.is_alive():
-            # Deadline exceeded — kill the runaway child and report timeout.
-            proc.kill()
-            proc.join()
-            return None, (
-                f"Execution timed out after {self._execution_timeout}s "
-                "(infinite loop or excessive computation)"
-            )
-
-        if out_queue.empty():
-            # Process exited without writing to the queue (e.g. segfault / OOM).
-            return None, f"Execution process exited unexpectedly (exit code {proc.exitcode})"
-
-        status, value = out_queue.get()
-        if status == "ok":
-            return np.array(value, dtype=np.int32), None
-        return None, value
+        """Execute generated code via arc.sandbox.execute() with this agent's timeout."""
+        return sandbox.execute(code, input_grid, self._execution_timeout)
 
     def _evaluate_test(self, code: str, test_pair: dict) -> bool:
         """Evaluate the best code against the held-out test pair's ground truth.
@@ -645,37 +514,8 @@ class SingleAgent:
         return grids_equal(output, test_pair["output"])
 
     def _evaluate_code(self, code: str, task: dict) -> dict:
-        """Run the generated code against all training pairs and collect results.
-
-        Returns the same structure as evaluate_task() in arc/evaluate.py, but
-        uses _execute() for isolation rather than calling the function directly.
-        """
-        pairs = []
-        for pair in task["train"]:
-            output, error = self._execute(code, pair["input"])
-            if error:
-                pairs.append({
-                    "correct":   False,
-                    "predicted": None,
-                    "expected":  pair["output"],
-                    "error":     error,
-                })
-            else:
-                correct = grids_equal(output, pair["output"])
-                pairs.append({
-                    "correct":   correct,
-                    "predicted": output,
-                    "expected":  pair["output"],
-                    "error":     None,
-                })
-
-        n_correct = sum(p["correct"] for p in pairs)
-        return {
-            "pairs":       pairs,
-            "n_correct":   n_correct,
-            "n_total":     len(pairs),
-            "all_correct": n_correct == len(pairs),
-        }
+        """Run the generated code against all training pairs via arc.sandbox."""
+        return sandbox.evaluate_code(code, task, self._execution_timeout)
 
     # ------------------------------------------------------------------
     # Model API (backend-agnostic routing)
