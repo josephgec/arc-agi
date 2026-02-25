@@ -737,6 +737,14 @@ class TestSolve:
         result = agent.solve(simple_task)
         assert not result["success"]
 
+    def test_n_attempts_accurate_on_timeout(self, simple_task):
+        """n_attempts must reflect the actual attempt count, not max_retries+1."""
+        agent = make_agent()
+        agent._client.generate.side_effect = TimeoutError("timed out")
+        result = agent.solve(simple_task)
+        assert not result["success"]
+        assert result["n_attempts"] == 1
+
     def test_solve_handles_missing_code_block(self, simple_task):
         """A response with no code block should be retried; eventual success must be detected."""
         agent = make_agent()

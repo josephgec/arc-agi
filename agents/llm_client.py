@@ -96,20 +96,21 @@ class LLMClient:
             TimeoutError: Ollama backend only — server never responded.
         """
         if self.backend == "anthropic":
-            return self._call_anthropic(system_prompt, messages)
+            return self._call_anthropic(system_prompt, messages, temperature)
         return self._call_ollama(system_prompt, messages, temperature)
 
     # ------------------------------------------------------------------
     # Private backends
     # ------------------------------------------------------------------
 
-    def _call_anthropic(self, system_prompt: str, messages: list[dict]) -> str:
+    def _call_anthropic(self, system_prompt: str, messages: list[dict], temperature: float) -> str:
         """Send a request to the Anthropic API and return the response text."""
         response = self._anthropic.messages.create(
             model=self.model,
             max_tokens=8192,
             system=system_prompt,
             messages=messages,
+            temperature=temperature,
         )
         return response.content[0].text
 

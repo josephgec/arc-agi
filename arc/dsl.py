@@ -216,6 +216,12 @@ def bounding_box(grid: Grid, color: int | None = None) -> tuple[int, int, int, i
 
 
 def crop_to_content(grid: Grid) -> Grid:
-    """Crop the grid to the tight bounding box of all non-background content."""
+    """Crop the grid to the tight bounding box of all non-background content.
+
+    Returns the original grid unchanged if the grid is entirely background.
+    """
+    bg = background_color(grid)
+    if (grid == bg).all():
+        return grid.copy()
     r_min, c_min, r_max, c_max = bounding_box(grid)
     return crop(grid, r_min, c_min, r_max + 1, c_max + 1)

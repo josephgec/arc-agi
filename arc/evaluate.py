@@ -5,7 +5,6 @@ and aggregating correctness metrics across a directory of task files.
 """
 from __future__ import annotations
 
-import json
 import traceback
 from pathlib import Path
 from typing import Callable

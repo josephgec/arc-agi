@@ -282,3 +282,11 @@ class TestGenerateAnthropic:
         client.generate("sys", [{"role": "user", "content": "hi"}])
         call_kwargs = client._anthropic.messages.create.call_args.kwargs
         assert call_kwargs["model"] == client.model
+
+    def test_temperature_passed_to_api(self):
+        """Temperature must be forwarded so greedy (0.0) and random (1.0) differ."""
+        client = self._client()
+        client._anthropic.messages.create.return_value = self._mock_api_response("x")
+        client.generate("sys", [{"role": "user", "content": "hi"}], temperature=0.4)
+        call_kwargs = client._anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["temperature"] == pytest.approx(0.4)

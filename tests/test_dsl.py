@@ -458,3 +458,17 @@ class TestCropToContent:
         grid = g([0, 0, 0, 0], [0, 1, 2, 0], [0, 3, 4, 0], [0, 0, 0, 0])
         result = crop_to_content(grid)
         assert result.shape == (2, 2)
+
+    def test_all_background_returns_full_grid(self):
+        """An all-background grid has no content to crop to; return it unchanged."""
+        grid = g([0, 0], [0, 0])
+        result = crop_to_content(grid)
+        assert result.shape == grid.shape
+        np.testing.assert_array_equal(result, grid)
+
+    def test_single_cell_at_origin_still_crops(self):
+        """A non-background cell at (0,0) must crop to 1×1, not return the full grid."""
+        grid = g([1, 0, 0], [0, 0, 0])
+        result = crop_to_content(grid)
+        assert result.shape == (1, 1)
+        assert result[0, 0] == 1

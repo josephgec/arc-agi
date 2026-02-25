@@ -291,7 +291,7 @@ class SingleAgent:
             "success":      False,
             "test_correct": self._evaluate_test(best_code, test_pair) if has_test_ground_truth and best_code else None,
             "code":         best_code,
-            "n_attempts":   self.max_retries + 1,
+            "n_attempts":   attempt,
             "log":          log,
         }
 
