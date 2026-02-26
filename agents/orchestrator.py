@@ -111,7 +111,7 @@ class Orchestrator:
                 log=log, test_pair=test_pair, has_ground_truth=has_test_ground_truth,
             )
 
-        hypotheses = _parse_hypotheses(hyp_response)
+        hypotheses = _parse_hypotheses(hyp_response, max_n=self.n_hypotheses)
         log.append({"state": STATE_HYPOTHESIZING, "n_hypotheses": len(hypotheses)})
         if self.debug:
             print(f"[orch] HYPOTHESIZING → {len(hypotheses)} hypothesis(es)")

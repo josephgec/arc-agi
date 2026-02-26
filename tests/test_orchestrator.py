@@ -43,6 +43,25 @@ def _wrong_code() -> str:
     return "```python\ndef transform(grid):\n    return grid.copy()\n```"
 
 
+# Three hypothesis strings that pass the 80-char minimum filter in _parse_hypotheses.
+_H1 = (
+    "1. Rotate the grid 90 degrees clockwise and recolor all blue cells to red.\n"
+    "   - step 1: apply rotate(grid, 3)\n"
+    "   - step 2: apply recolor(grid, 1, 2)"
+)
+_H2 = (
+    "2. Find the background color (most frequent) and replace every other cell with grey.\n"
+    "   - step 1: count frequencies with np.bincount\n"
+    "   - step 2: np.where to replace non-background cells"
+)
+_H3 = (
+    "3. Tile the top-left quadrant four times to produce a doubled output grid.\n"
+    "   - step 1: crop top-left quadrant\n"
+    "   - step 2: tile(grid, 2, 2) to fill the output"
+)
+_HYP3 = f"{_H1}\n{_H2}\n{_H3}"
+
+
 def _critic_coder(feedback: str = "fix the bug") -> dict:
     return {"route": "coder", "feedback": feedback}
 
@@ -171,7 +190,7 @@ class TestSolveSuccess:
     def test_multiple_hypotheses_each_produce_candidate(self):
         """When every hypothesis passes, all are saved as candidates."""
         orch = make_orchestrator(n_hypotheses=3)
-        orch._hypothesizer.generate.return_value = "1. H\n2. H\n3. H"
+        orch._hypothesizer.generate.return_value = _HYP3
         orch._coder.generate.return_value         = _correct_code()
 
         result = orch.solve(simple_task())
@@ -220,7 +239,7 @@ class TestCriticRouting:
     def test_hypothesizer_route_abandons_hypothesis(self):
         """HYPOTHESIZER route must skip to the next hypothesis immediately."""
         orch = make_orchestrator(max_retries=2)
-        orch._hypothesizer.generate.return_value = "1. H1\n2. H2\n3. H3"
+        orch._hypothesizer.generate.return_value = _HYP3
         # hyp 0: 1 wrong attempt → Critic → hypothesizer → abandon
         # hyps 1 & 2: correct on first attempt
         orch._coder.generate.side_effect = [
@@ -268,7 +287,7 @@ class TestCriticRouting:
     def test_max_retries_zero_means_no_retry(self):
         """max_retries=0 → only one Coder attempt per hypothesis, no retry."""
         orch = make_orchestrator(max_retries=0)
-        orch._hypothesizer.generate.return_value = "1. H\n2. H\n3. H"
+        orch._hypothesizer.generate.return_value = _HYP3
         orch._coder.generate.return_value  = _wrong_code()
         orch._critic.analyze.return_value  = _critic_coder()
 
@@ -321,10 +340,10 @@ class TestSolveFailure:
     def test_coder_exception_abandons_hypothesis(self):
         """A Coder exception should abandon the current hypothesis and try the next."""
         orch = make_orchestrator(max_retries=0)
-        orch._hypothesizer.generate.return_value = "1. H\n2. H\n3. H"
+        orch._hypothesizer.generate.return_value = _HYP3
         orch._coder.generate.side_effect = [
-            TimeoutError("timed out"),  # hypothesis 1 fails
-            _correct_code(),            # hypothesis 2 succeeds
+            TimeoutError("timed out"),  # hypothesis 0 fails
+            _correct_code(),            # hypothesis 1 succeeds
             _correct_code(),
         ]
 
@@ -333,9 +352,9 @@ class TestSolveFailure:
 
     def test_critic_exception_abandons_hypothesis(self):
         orch = make_orchestrator(max_retries=1)
-        orch._hypothesizer.generate.return_value = "1. H\n2. H2 correct rule\n3. H"
+        orch._hypothesizer.generate.return_value = _HYP3
         orch._coder.generate.side_effect = [
-            _wrong_code(),      # hyp 0 fails
+            _wrong_code(),      # hyp 0 fails → Critic raises → abandon hyp 0
             _correct_code(),    # hyp 1 succeeds
             _correct_code(),
         ]
@@ -346,7 +365,7 @@ class TestSolveFailure:
 
     def test_no_code_block_abandons_hypothesis(self):
         orch = make_orchestrator(max_retries=1)
-        orch._hypothesizer.generate.return_value = "1. H\n2. H\n3. H"
+        orch._hypothesizer.generate.return_value = _HYP3
         orch._coder.generate.side_effect = [
             "I don't know how to do this.",  # no code block → abandon hyp 0
             _correct_code(),                  # hyp 1 succeeds

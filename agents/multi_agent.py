@@ -176,16 +176,46 @@ def _extract_code(text: str) -> str | None:
 # Hypothesis parsing
 # ---------------------------------------------------------------------------
 
-def _parse_hypotheses(text: str) -> list[str]:
+_MIN_HYPOTHESIS_CHARS = 80  # filter out short noise fragments from reasoning
+
+
+def _parse_hypotheses(text: str, max_n: int | None = None) -> list[str]:
     """Split the Hypothesizer's output into individual hypothesis strings.
 
-    Splits on lines beginning with a digit followed by a period (1., 2., 3.).
-    Returns the original text as a single-item list when no numbered split found.
+    Strategy:
+    1. Try paragraph-level splitting — only keeps items that begin a new blank-
+       line-separated paragraph with a digit+period.  This avoids matching
+       numbered sub-steps that reasoning models embed inside prose.
+    2. Fall back to line-level splitting when paragraph splitting finds < 2 items.
+    3. Filter out short fragments (< _MIN_HYPOTHESIS_CHARS) that are noise.
+    4. Cap at max_n when provided.
+
+    Returns the original text as a single-item list when no numbered items found.
     """
-    text  = _strip_thinking(text)
-    parts = re.split(r"(?m)^(?=[1-9]\.\s)", text.strip())
-    hypotheses = [p.strip() for p in parts if p.strip()]
-    return hypotheses if len(hypotheses) >= 2 else [text.strip()]
+    text    = _strip_thinking(text)
+    stripped = text.strip()
+
+    # ── Strategy 1: paragraph-level (blank-line delimited) ──────────────────
+    paragraphs  = re.split(r"\n\s*\n", stripped)
+    hyp_paras   = [p.strip() for p in paragraphs
+                   if re.match(r"^[1-9]\.\s", p.strip())]
+    if len(hyp_paras) >= 2:
+        hypotheses = hyp_paras
+    else:
+        # ── Strategy 2: line-level fallback ─────────────────────────────────
+        parts      = re.split(r"(?m)^(?=[1-9]\.\s)", stripped)
+        hypotheses = [p.strip() for p in parts if p.strip()]
+        if len(hypotheses) < 2:
+            return [stripped] if stripped else []
+
+    # Filter noise (short fragments are almost always reasoning fragments, not
+    # full algorithm descriptions).
+    hypotheses = [h for h in hypotheses if len(h) >= _MIN_HYPOTHESIS_CHARS]
+
+    if max_n is not None:
+        hypotheses = hypotheses[:max_n]
+
+    return hypotheses if hypotheses else [stripped]
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +372,7 @@ class MultiAgent:
                     break
 
                 hyp_feedback = None
-                hypotheses   = _parse_hypotheses(hyp_response)
+                hypotheses   = _parse_hypotheses(hyp_response, max_n=3)
                 hyp_index    = 0
 
                 log.append({

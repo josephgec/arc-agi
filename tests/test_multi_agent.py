@@ -105,18 +105,23 @@ class TestExtractCode:
 # _parse_hypotheses
 # ---------------------------------------------------------------------------
 
+_H1 = "1. Rotate the grid 90 degrees clockwise and then recolor all red cells to blue.\n- step A: rotate\n- step B: recolor"
+_H2 = "2. Find the most frequent color (background) and replace every other cell with grey (5).\n- step A: count\n- step B: replace"
+_H3 = "3. Tile the top-left quadrant four times to fill the entire output grid of double the size.\n- step A: crop\n- step B: tile"
+
+
 class TestParseHypotheses:
     def test_three_numbered_hypotheses(self):
-        text = "1. First hypothesis\n- step\n2. Second hypothesis\n- step\n3. Third hypothesis\n- step"
+        text = f"{_H1}\n{_H2}\n{_H3}"
         result = _parse_hypotheses(text)
         assert len(result) == 3
 
     def test_each_contains_hypothesis_text(self):
-        text = "1. Alpha\n- do A\n2. Beta\n- do B\n3. Gamma\n- do C"
+        text = f"{_H1}\n{_H2}\n{_H3}"
         result = _parse_hypotheses(text)
-        assert any("Alpha" in h for h in result)
-        assert any("Beta" in h for h in result)
-        assert any("Gamma" in h for h in result)
+        assert any("Rotate" in h for h in result)
+        assert any("background" in h for h in result)
+        assert any("quadrant" in h for h in result)
 
     def test_unparseable_returns_single_item(self):
         text = "Just a single blob of text with no numbers."
@@ -125,12 +130,45 @@ class TestParseHypotheses:
         assert result[0] == text
 
     def test_strips_thinking_before_parsing(self):
-        text = "<think>draft</think>1. First\n2. Second\n3. Third"
+        text = f"<think>draft reasoning</think>{_H1}\n{_H2}\n{_H3}"
         result = _parse_hypotheses(text)
         assert all("<think>" not in h for h in result)
 
     def test_two_hypotheses_still_split(self):
-        text = "1. One\n- step\n2. Two\n- step"
+        text = f"{_H1}\n{_H2}"
+        result = _parse_hypotheses(text)
+        assert len(result) == 2
+
+    def test_max_n_caps_output(self):
+        """max_n=2 on a 3-hypothesis response returns at most 2 items."""
+        text = f"{_H1}\n{_H2}\n{_H3}"
+        result = _parse_hypotheses(text, max_n=2)
+        assert len(result) == 2
+        assert "Rotate" in result[0]
+
+    def test_short_noise_fragments_filtered(self):
+        """Short one-liners (reasoning noise) are filtered out, leaving only full hypotheses."""
+        # Mix one full hypothesis with two noise fragments
+        noise = "1. Yes.\n2. Maybe not.\n"
+        text = noise + _H3
+        result = _parse_hypotheses(text)
+        # Only _H3 is long enough; noise items should be dropped
+        assert all(len(h) >= 80 for h in result)
+
+    def test_paragraph_level_split_preferred(self):
+        """Blank-line-separated numbered paragraphs are found even when inner steps
+        also use numbers — only the paragraph-level items are returned."""
+        h1 = (
+            "1. Identify the dominant color by scanning the entire grid cell by cell.\n"
+            "   - step 1: count occurrences\n"
+            "   - step 2: pick the max"
+        )
+        h2 = (
+            "2. Replace every cell that differs from the dominant color with grey (5).\n"
+            "   - step 1: iterate cells\n"
+            "   - step 2: apply replacement"
+        )
+        text = h1 + "\n\n" + h2
         result = _parse_hypotheses(text)
         assert len(result) == 2
 
