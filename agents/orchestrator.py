@@ -44,34 +44,61 @@ class Orchestrator:
     Outer loop: iterate over each hypothesis produced by the Hypothesizer.
     Inner loop: give the Coder up to (max_retries + 1) attempts per hypothesis.
 
+    Each agent role can use a different model, which is critical because the
+    optimal model varies by task: the Hypothesizer benefits from a strong
+    reasoning model (e.g. deepseek-r1:32b) while the Coder benefits from a
+    model purpose-built for code generation (e.g. qwen2.5-coder:7b).
+
     Args:
-        backend:      'ollama' or 'anthropic'.
-        model:        Model name override.
-        timeout:      Seconds per LLM call (Ollama only).
-        debug:        Print state transitions to stdout.
-        n_hypotheses: Number of hypotheses to request from the Hypothesizer.
-        max_retries:  Maximum additional Coder attempts per hypothesis after
-                      the first (total Coder calls per hypothesis = max_retries + 1).
+        backend:            'ollama' or 'anthropic'.
+        model:              Fallback model for any role that doesn't specify one.
+                            Defaults to the backend's built-in default.
+        hypothesizer_model: Model for the Hypothesizer role.  Falls back to
+                            ``model`` then the backend default.
+        coder_model:        Model for the Coder role.
+        critic_model:       Model for the Critic role.
+        timeout:            Seconds per LLM call (Ollama only).
+        debug:              Print state transitions to stdout.
+        n_hypotheses:       Number of hypotheses to request from the Hypothesizer.
+        max_retries:        Maximum additional Coder attempts per hypothesis after
+                            the first (total = max_retries + 1).
     """
 
     def __init__(
         self,
-        backend:      str        = "ollama",
-        model:        str | None = None,
-        timeout:      float      = 120.0,
-        debug:        bool       = False,
-        n_hypotheses: int        = 3,
-        max_retries:  int        = 2,
+        backend:            str        = "ollama",
+        model:              str | None = None,
+        hypothesizer_model: str | None = None,
+        coder_model:        str | None = None,
+        critic_model:       str | None = None,
+        timeout:            float      = 120.0,
+        debug:              bool       = False,
+        n_hypotheses:       int        = 3,
+        max_retries:        int        = 2,
     ) -> None:
-        client             = LLMClient(backend=backend, model=model, timeout=timeout, debug=debug)
-        self._hypothesizer = Hypothesizer(client)
-        self._coder        = Coder(client)
-        self._critic       = Critic(client)
-        self.n_hypotheses  = n_hypotheses
-        self.max_retries   = max_retries
-        self.debug         = debug
-        self.backend       = client.backend
-        self.model         = client.model
+        def _make_client(role_model: str | None) -> LLMClient:
+            return LLMClient(
+                backend=backend,
+                model=role_model or model,
+                timeout=timeout,
+                debug=debug,
+            )
+
+        hyp_client = _make_client(hypothesizer_model)
+        cod_client = _make_client(coder_model)
+        cri_client = _make_client(critic_model)
+
+        self._hypothesizer      = Hypothesizer(hyp_client)
+        self._coder             = Coder(cod_client)
+        self._critic            = Critic(cri_client)
+        self.n_hypotheses       = n_hypotheses
+        self.max_retries        = max_retries
+        self.debug              = debug
+        self.backend            = backend
+        self.hypothesizer_model = hyp_client.model
+        self.coder_model        = cod_client.model
+        self.critic_model       = cri_client.model
+        self.model              = self.hypothesizer_model  # primary / backward-compat alias
 
     # ------------------------------------------------------------------
     # Public API

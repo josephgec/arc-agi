@@ -124,24 +124,37 @@ class Ensemble:
 
     def __init__(
         self,
-        backend:           str        = "ollama",
-        model:             str | None = None,
-        timeout:           float      = 120.0,
-        debug:             bool       = False,
-        target_candidates: int        = 3,
-        max_runs:          int        = 5,
-        n_hypotheses:      int        = 3,
-        max_retries:       int        = 2,
+        backend:            str        = "ollama",
+        model:              str | None = None,
+        hypothesizer_model: str | None = None,
+        coder_model:        str | None = None,
+        critic_model:       str | None = None,
+        timeout:            float      = 120.0,
+        debug:              bool       = False,
+        target_candidates:  int        = 3,
+        max_runs:           int        = 5,
+        n_hypotheses:       int        = 3,
+        max_retries:        int        = 2,
     ) -> None:
         self._orchestrator    = Orchestrator(
-            backend=backend, model=model, timeout=timeout, debug=debug,
-            n_hypotheses=n_hypotheses, max_retries=max_retries,
+            backend=backend,
+            model=model,
+            hypothesizer_model=hypothesizer_model,
+            coder_model=coder_model,
+            critic_model=critic_model,
+            timeout=timeout,
+            debug=debug,
+            n_hypotheses=n_hypotheses,
+            max_retries=max_retries,
         )
-        self.target_candidates = target_candidates
-        self.max_runs          = max_runs
-        self.debug             = debug
-        self.backend           = self._orchestrator.backend
-        self.model             = self._orchestrator.model
+        self.target_candidates  = target_candidates
+        self.max_runs           = max_runs
+        self.debug              = debug
+        self.backend            = self._orchestrator.backend
+        self.hypothesizer_model = self._orchestrator.hypothesizer_model
+        self.coder_model        = self._orchestrator.coder_model
+        self.critic_model       = self._orchestrator.critic_model
+        self.model              = self._orchestrator.model
 
     # ------------------------------------------------------------------
     # Public API

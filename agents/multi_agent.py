@@ -300,29 +300,49 @@ class MultiAgent:
             - CODER route        → retry same hypothesis with feedback.
 
     Args:
-        backend:    'ollama' or 'anthropic'.
-        model:      Model name override.
-        timeout:    Seconds to wait per LLM call (Ollama only).
-        debug:      Print diagnostic output to stdout.
-        max_cycles: Maximum total agent calls before giving up.
+        backend:            'ollama' or 'anthropic'.
+        model:              Fallback model for any role that doesn't specify one.
+        hypothesizer_model: Model for the Hypothesizer role.
+        coder_model:        Model for the Coder role.
+        critic_model:       Model for the Critic role.
+        timeout:            Seconds to wait per LLM call (Ollama only).
+        debug:              Print diagnostic output to stdout.
+        max_cycles:         Maximum total agent calls before giving up.
     """
 
     def __init__(
         self,
-        backend:    str   = "ollama",
-        model:      str | None = None,
-        timeout:    float = 120.0,
-        debug:      bool  = False,
-        max_cycles: int   = 9,
+        backend:            str        = "ollama",
+        model:              str | None = None,
+        hypothesizer_model: str | None = None,
+        coder_model:        str | None = None,
+        critic_model:       str | None = None,
+        timeout:            float      = 120.0,
+        debug:              bool       = False,
+        max_cycles:         int        = 9,
     ) -> None:
-        client             = LLMClient(backend=backend, model=model, timeout=timeout, debug=debug)
-        self._hypothesizer = Hypothesizer(client)
-        self._coder        = Coder(client)
-        self._critic       = Critic(client)
-        self.max_cycles    = max_cycles
-        self.debug         = debug
-        self.backend       = client.backend
-        self.model         = client.model
+        def _make_client(role_model: str | None) -> LLMClient:
+            return LLMClient(
+                backend=backend,
+                model=role_model or model,
+                timeout=timeout,
+                debug=debug,
+            )
+
+        hyp_client = _make_client(hypothesizer_model)
+        cod_client = _make_client(coder_model)
+        cri_client = _make_client(critic_model)
+
+        self._hypothesizer      = Hypothesizer(hyp_client)
+        self._coder             = Coder(cod_client)
+        self._critic            = Critic(cri_client)
+        self.max_cycles         = max_cycles
+        self.debug              = debug
+        self.backend            = backend
+        self.hypothesizer_model = hyp_client.model
+        self.coder_model        = cod_client.model
+        self.critic_model       = cri_client.model
+        self.model              = self.hypothesizer_model  # primary / backward-compat alias
 
     # ------------------------------------------------------------------
     # Public API

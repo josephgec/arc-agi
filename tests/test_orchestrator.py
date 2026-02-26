@@ -70,12 +70,25 @@ def _critic_hyp(feedback: str = "logic flaw") -> dict:
     return {"route": "hypothesizer", "feedback": feedback}
 
 
+def _mock_client_factory(backend: str = "ollama", model: str = "test-model"):
+    """Return a side_effect callable that produces a fresh MagicMock per LLMClient call.
+
+    Each call to LLMClient(...) returns a new mock whose .model is taken from
+    the ``model`` kwarg passed to LLMClient, falling back to the provided default.
+    This lets tests verify that per-role models are stored correctly.
+    """
+    def factory(**kwargs):
+        mc = MagicMock()
+        mc.backend = backend
+        mc.model   = kwargs.get("model") or model
+        return mc
+    return factory
+
+
 def make_orchestrator(n_hypotheses: int = 3, max_retries: int = 2) -> Orchestrator:
     """Create an Orchestrator with all three role sub-agents mocked out."""
-    mock_client         = MagicMock()
-    mock_client.backend = "ollama"
-    mock_client.model   = "test-model"
-    with patch("agents.orchestrator.LLMClient", return_value=mock_client):
+    with patch("agents.orchestrator.LLMClient",
+               side_effect=_mock_client_factory("ollama", "test-model")):
         orch = Orchestrator(
             backend="ollama",
             n_hypotheses=n_hypotheses,
@@ -93,18 +106,49 @@ def make_orchestrator(n_hypotheses: int = 3, max_retries: int = 2) -> Orchestrat
 
 class TestOrchestratorInit:
     def _make(self, **kwargs) -> Orchestrator:
-        mock_client         = MagicMock()
-        mock_client.backend = kwargs.get("backend", "ollama")
-        mock_client.model   = "m"
-        with patch("agents.orchestrator.LLMClient", return_value=mock_client):
+        backend = kwargs.get("backend", "ollama")
+        with patch("agents.orchestrator.LLMClient",
+                   side_effect=_mock_client_factory(backend, "m")):
             return Orchestrator(**kwargs)
 
     def test_backend_stored(self):
         assert self._make(backend="ollama").backend == "ollama"
 
     def test_model_stored(self):
+        """orch.model is an alias for the hypothesizer model."""
         orch = self._make()
         assert orch.model == "m"
+
+    def test_hypothesizer_model_stored(self):
+        orch = self._make(hypothesizer_model="deepseek-r1:32b")
+        assert orch.hypothesizer_model == "deepseek-r1:32b"
+
+    def test_coder_model_stored(self):
+        orch = self._make(coder_model="qwen2.5-coder:7b")
+        assert orch.coder_model == "qwen2.5-coder:7b"
+
+    def test_critic_model_stored(self):
+        orch = self._make(critic_model="deepseek-r1:8b")
+        assert orch.critic_model == "deepseek-r1:8b"
+
+    def test_per_role_models_are_independent(self):
+        """Each role gets its own model; they don't bleed into one another."""
+        orch = self._make(
+            hypothesizer_model="deepseek-r1:32b",
+            coder_model="qwen2.5-coder:7b",
+            critic_model="deepseek-r1:8b",
+        )
+        assert orch.hypothesizer_model == "deepseek-r1:32b"
+        assert orch.coder_model        == "qwen2.5-coder:7b"
+        assert orch.critic_model       == "deepseek-r1:8b"
+        assert orch.model              == "deepseek-r1:32b"  # alias → hypothesizer
+
+    def test_fallback_model_used_when_role_not_specified(self):
+        """When only ``model`` is given, all roles inherit it."""
+        orch = self._make(model="qwen2.5:32b")
+        assert orch.hypothesizer_model == "qwen2.5:32b"
+        assert orch.coder_model        == "qwen2.5:32b"
+        assert orch.critic_model       == "qwen2.5:32b"
 
     def test_max_retries_stored(self):
         assert self._make(max_retries=4).max_retries == 4
