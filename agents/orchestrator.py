@@ -44,61 +44,72 @@ class Orchestrator:
     Outer loop: iterate over each hypothesis produced by the Hypothesizer.
     Inner loop: give the Coder up to (max_retries + 1) attempts per hypothesis.
 
-    Each agent role can use a different model, which is critical because the
-    optimal model varies by task: the Hypothesizer benefits from a strong
-    reasoning model (e.g. deepseek-r1:32b) while the Coder benefits from a
-    model purpose-built for code generation (e.g. qwen2.5-coder:7b).
+    Each agent role uses a dedicated model and temperature, matched to the
+    cognitive demands of the task:
+      - Hypothesizer: deepseek-r1:32b at temp 0.6 — creative spatial reasoning
+      - Coder:        qwen2.5-coder:14b at temp 0.1 — deterministic code output
+      - Critic:       deepseek-r1:14b at temp 0.2 — nuanced failure diagnosis
 
     Args:
-        backend:            'ollama' or 'anthropic'.
-        model:              Fallback model for any role that doesn't specify one.
-                            Defaults to the backend's built-in default.
-        hypothesizer_model: Model for the Hypothesizer role.  Falls back to
-                            ``model`` then the backend default.
-        coder_model:        Model for the Coder role.
-        critic_model:       Model for the Critic role.
-        timeout:            Seconds per LLM call (Ollama only).
-        debug:              Print state transitions to stdout.
-        n_hypotheses:       Number of hypotheses to request from the Hypothesizer.
-        max_retries:        Maximum additional Coder attempts per hypothesis after
-                            the first (total = max_retries + 1).
+        backend:                  'ollama' or 'anthropic'.
+        model:                    Fallback model for any role that doesn't specify one.
+                                  Defaults to the backend's built-in default.
+        hypothesizer_model:       Model for the Hypothesizer role.
+        coder_model:              Model for the Coder role.
+        critic_model:             Model for the Critic role.
+        hypothesizer_temperature: Sampling temperature for the Hypothesizer (default 0.6).
+        coder_temperature:        Sampling temperature for the Coder (default 0.1).
+                                  Used as the base of the retry temperature ramp.
+        critic_temperature:       Sampling temperature for the Critic (default 0.2).
+        timeout:                  Seconds per LLM call (Ollama only).
+        debug:                    Print state transitions to stdout.
+        n_hypotheses:             Number of hypotheses to request from the Hypothesizer.
+        max_retries:              Maximum additional Coder attempts per hypothesis after
+                                  the first (total = max_retries + 1).
     """
 
     def __init__(
         self,
-        backend:            str        = "ollama",
-        model:              str | None = None,
-        hypothesizer_model: str | None = None,
-        coder_model:        str | None = None,
-        critic_model:       str | None = None,
-        timeout:            float      = 120.0,
-        debug:              bool       = False,
-        n_hypotheses:       int        = 3,
-        max_retries:        int        = 2,
+        backend:                  str        = "ollama",
+        model:                    str | None = None,
+        hypothesizer_model:       str | None = None,
+        coder_model:              str | None = None,
+        critic_model:             str | None = None,
+        hypothesizer_temperature: float      = 0.6,
+        coder_temperature:        float      = 0.1,
+        critic_temperature:       float      = 0.2,
+        timeout:                  float      = 120.0,
+        debug:                    bool       = False,
+        n_hypotheses:             int        = 3,
+        max_retries:              int        = 2,
     ) -> None:
-        def _make_client(role_model: str | None) -> LLMClient:
+        def _make_client(role_model: str | None, temperature: float) -> LLMClient:
             return LLMClient(
                 backend=backend,
                 model=role_model or model,
+                temperature=temperature,
                 timeout=timeout,
                 debug=debug,
             )
 
-        hyp_client = _make_client(hypothesizer_model)
-        cod_client = _make_client(coder_model)
-        cri_client = _make_client(critic_model)
+        hyp_client = _make_client(hypothesizer_model, hypothesizer_temperature)
+        cod_client = _make_client(coder_model,        coder_temperature)
+        cri_client = _make_client(critic_model,       critic_temperature)
 
-        self._hypothesizer      = Hypothesizer(hyp_client)
-        self._coder             = Coder(cod_client)
-        self._critic            = Critic(cri_client)
-        self.n_hypotheses       = n_hypotheses
-        self.max_retries        = max_retries
-        self.debug              = debug
-        self.backend            = backend
-        self.hypothesizer_model = hyp_client.model
-        self.coder_model        = cod_client.model
-        self.critic_model       = cri_client.model
-        self.model              = self.hypothesizer_model  # primary / backward-compat alias
+        self._hypothesizer           = Hypothesizer(hyp_client)
+        self._coder                  = Coder(cod_client)
+        self._critic                 = Critic(cri_client)
+        self.n_hypotheses            = n_hypotheses
+        self.max_retries             = max_retries
+        self.debug                   = debug
+        self.backend                 = backend
+        self.hypothesizer_model      = hyp_client.model
+        self.coder_model             = cod_client.model
+        self.critic_model            = cri_client.model
+        self.hypothesizer_temperature = hypothesizer_temperature
+        self.coder_temperature        = coder_temperature
+        self.critic_temperature       = critic_temperature
+        self.model                   = self.hypothesizer_model  # backward-compat alias
 
     # ------------------------------------------------------------------
     # Public API
@@ -157,8 +168,8 @@ class Orchestrator:
             for attempt in range(1, self.max_retries + 2):
                 is_last_attempt = (attempt == self.max_retries + 1)
 
-                # Temperature diversity: 0.0 on first attempt, ramp up on retries.
-                temperature = min((attempt - 1) * 0.3, 0.8)
+                # Temperature diversity: start from role baseline, ramp up on retries.
+                temperature = min(self.coder_temperature + (attempt - 1) * 0.3, 0.9)
 
                 # ----------------------------------------------------------
                 # STATE: CODING

@@ -138,26 +138,26 @@ You are a Python code generator for ARC-AGI puzzles.
 
 You will be given a natural-language transformation rule.
 Implement it immediately as a Python function. Start your response with ```python.
+Do NOT think out loud. Do NOT explain. Do NOT write prose. Output ONLY the code block.
 
 {dsl_docs}
 
-CRITICAL WARNING — AVOID SEQUENTIAL OVERWRITE BUGS:
-When swapping colors or applying multiple color rules, NEVER mutate the grid
-sequentially. Doing so will accidentally overwrite your previous changes.
+CRITICAL RULE: NEVER mutate NumPy grids sequentially when swapping colors or \
+applying multiple rules (e.g., `grid[grid==1]=2` then `grid[grid==2]=1`). This \
+creates overlapping overwrite bugs. ALWAYS use `np.copy()`, `np.where()`, or \
+`np.select()` to apply transformations simultaneously.
 
-BAD (causes overlap — the second line modifies cells just set by the first):
+BAD — sequential mutation destroys earlier writes:
     grid[grid == 1] = 2
-    grid[grid == 2] = 1  # Wrong: also changes the 1s that were just set to 2
+    grid[grid == 2] = 1  # BUG: also overwrites the 1→2 cells just set above
 
-GOOD — use a copy so the source values are frozen before any writes:
+GOOD — freeze source values with a copy first:
     new_grid = np.copy(grid)
     new_grid[grid == 1] = 2
     new_grid[grid == 2] = 1
 
-GOOD — use np.select to build the result in one vectorised step:
-    conditions = [grid == 1, grid == 2]
-    choices    = [2, 1]
-    new_grid   = np.select(conditions, choices, default=grid)
+GOOD — build result in a single vectorised step:
+    new_grid = np.select([grid == 1, grid == 2], [2, 1], default=grid)
 
 Output ONLY the ```python code block. No explanation. No commentary. No prose.\
 """
@@ -241,6 +241,15 @@ Option A — FLAWED HYPOTHESIS: The logical rule itself is wrong, incomplete, or
 
 Option B — CODING ERROR: The hypothesis is sound but was implemented incorrectly.
   → The Coder must fix the implementation bug.
+
+Common coding errors to check:
+- SEQUENTIAL OVERWRITE BUG: CRITICAL RULE: NEVER mutate NumPy grids sequentially \
+when swapping colors or applying multiple rules (e.g., `grid[grid==1]=2` then \
+`grid[grid==2]=1`). This creates overlapping overwrite bugs. ALWAYS use `np.copy()`, \
+`np.where()`, or `np.select()` to apply transformations simultaneously.
+- Shape errors: output array has wrong dimensions (forgot to allocate new array).
+- Off-by-one errors in bounding box, crop, or loop indices.
+- Wrong color constant (0=black,1=blue,2=red,3=green,4=yellow,5=grey,6=fuschia,7=orange,8=azure,9=maroon).
 
 Analyze the failure, then end your response with EXACTLY one of these two lines:
 ROUTE: HYPOTHESIZER

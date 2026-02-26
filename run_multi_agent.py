@@ -89,10 +89,27 @@ def _parse_args() -> argparse.Namespace:
              "Default: qwen2.5-coder:14b (~9 GB Q4_K_M).",
     )
     p.add_argument(
-        "--critic-model", default="qwen2.5-coder:14b",
+        "--critic-model", default="deepseek-r1:14b",
         dest="critic_model", metavar="MODEL",
         help="Model for the Critic (failure diagnosis).  "
-             "Default: qwen2.5-coder:14b — reuses the Coder slot, saving ~9 GB.",
+             "Default: deepseek-r1:14b (~9 GB Q4_K_M).",
+    )
+
+    # Per-role temperatures
+    p.add_argument(
+        "--hypothesizer-temperature", type=float, default=0.6,
+        dest="hypothesizer_temperature", metavar="T",
+        help="Sampling temperature for the Hypothesizer (default 0.6 — creative reasoning).",
+    )
+    p.add_argument(
+        "--coder-temperature", type=float, default=0.1,
+        dest="coder_temperature", metavar="T",
+        help="Base sampling temperature for the Coder (default 0.1 — deterministic code).",
+    )
+    p.add_argument(
+        "--critic-temperature", type=float, default=0.2,
+        dest="critic_temperature", metavar="T",
+        help="Sampling temperature for the Critic (default 0.2 — nuanced analysis).",
     )
 
     # Orchestrator tuning
@@ -171,6 +188,9 @@ def main() -> None:
         hypothesizer_model=args.hypothesizer_model,
         coder_model=args.coder_model,
         critic_model=args.critic_model,
+        hypothesizer_temperature=args.hypothesizer_temperature,
+        coder_temperature=args.coder_temperature,
+        critic_temperature=args.critic_temperature,
         n_hypotheses=args.n_hypotheses,
         max_retries=args.max_retries,
         timeout=args.timeout,
@@ -178,9 +198,9 @@ def main() -> None:
     )
 
     print(f"Backend:  {orch.backend}")
-    print(f"  Hypothesizer: {orch.hypothesizer_model}")
-    print(f"  Coder:        {orch.coder_model}")
-    print(f"  Critic:       {orch.critic_model}")
+    print(f"  Hypothesizer: {orch.hypothesizer_model}  (temp={orch.hypothesizer_temperature})")
+    print(f"  Coder:        {orch.coder_model}  (temp={orch.coder_temperature})")
+    print(f"  Critic:       {orch.critic_model}  (temp={orch.critic_temperature})")
     print(f"  n_hypotheses={orch.n_hypotheses}  max_retries={orch.max_retries}")
 
     if args.task:

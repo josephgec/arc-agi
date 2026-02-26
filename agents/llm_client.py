@@ -51,11 +51,13 @@ class LLMClient:
         self,
         backend: str = "ollama",
         model: str | None = None,
+        temperature: float = 0.0,
         timeout: float = 120.0,
         debug: bool = False,
     ) -> None:
-        self.debug    = debug
-        self._timeout = timeout
+        self.debug       = debug
+        self._timeout    = timeout
+        self.temperature = temperature  # role-specific default; overridden per-call when needed
 
         if backend == "ollama":
             self.backend = "ollama"
@@ -79,7 +81,7 @@ class LLMClient:
         self,
         system_prompt: str,
         messages: list[dict],
-        temperature: float = 0.0,
+        temperature: float | None = None,
     ) -> str:
         """Request a completion and return the response text.
 
@@ -95,6 +97,8 @@ class LLMClient:
         Raises:
             TimeoutError: Ollama backend only — server never responded.
         """
+        if temperature is None:
+            temperature = self.temperature
         if self.backend == "anthropic":
             return self._call_anthropic(system_prompt, messages, temperature)
         return self._call_ollama(system_prompt, messages, temperature)

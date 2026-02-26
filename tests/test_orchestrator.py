@@ -165,6 +165,25 @@ class TestOrchestratorInit:
         assert isinstance(orch._coder,        Coder)
         assert isinstance(orch._critic,       Critic)
 
+    def test_hypothesizer_temperature_default(self):
+        assert self._make().hypothesizer_temperature == pytest.approx(0.6)
+
+    def test_coder_temperature_default(self):
+        assert self._make().coder_temperature == pytest.approx(0.1)
+
+    def test_critic_temperature_default(self):
+        assert self._make().critic_temperature == pytest.approx(0.2)
+
+    def test_temperature_overrides_stored(self):
+        orch = self._make(
+            hypothesizer_temperature=0.9,
+            coder_temperature=0.0,
+            critic_temperature=0.5,
+        )
+        assert orch.hypothesizer_temperature == pytest.approx(0.9)
+        assert orch.coder_temperature        == pytest.approx(0.0)
+        assert orch.critic_temperature       == pytest.approx(0.5)
+
 
 # ---------------------------------------------------------------------------
 # solve() — happy path

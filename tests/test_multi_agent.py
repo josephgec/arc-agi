@@ -132,6 +132,35 @@ class TestExtractCode:
         text = "You could use import numpy as np to solve this."
         assert _extract_code(text) is None
 
+    def test_last_python_block_preferred_over_first(self):
+        """When multiple ```python blocks exist, the last one is used (it's the final answer)."""
+        draft  = "```python\ndef transform(grid):\n    return grid * 0\n```"
+        final  = "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
+        text   = f"My reasoning:\n{draft}\n\nFinal answer:\n{final}"
+        code   = _extract_code(text)
+        assert "recolor" in code
+        assert "grid * 0" not in code
+
+    def test_last_def_transform_preferred_over_first(self):
+        """When multiple bare def transform( exist, the last one is used."""
+        text = (
+            "Draft:\ndef transform(grid):\n    return grid.copy()\n\n"
+            "Final:\ndef transform(grid):\n    return recolor(grid, 1, 2)\n"
+        )
+        code = _extract_code(text)
+        assert "recolor" in code
+        assert "grid.copy()" not in code
+
+    def test_think_block_stripped_before_extraction(self):
+        """Code inside <think> is ignored; only code after the tag is extracted."""
+        text = (
+            "<think>\ndef transform(grid):\n    return grid * 0\n</think>\n"
+            "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
+        )
+        code = _extract_code(text)
+        assert "recolor" in code
+        assert "grid * 0" not in code
+
 
 # ---------------------------------------------------------------------------
 # _parse_hypotheses

@@ -152,48 +152,60 @@ def _truncate_to_valid_function(text: str) -> str:
 def _extract_code(text: str) -> str | None:
     """Extract executable Python code from a model response.
 
-    Four-step cascade with increasing tolerance for missing formatting:
+    Strips ``<think>`` blocks first (belt-and-suspenders — callers may or may
+    not have done this already), then applies a five-step cascade with
+    increasing tolerance for missing formatting.
 
-    1. Fenced ```python … ``` block.  Uses ``\\s*`` (not ``\\n``) so code that
-       appears on the same line as the opening fence is still captured — a
-       common artefact when a model runs close to its token limit and omits the
-       newline.
+    Critically, when multiple matches exist (reasoning models write draft code
+    inside their chain-of-thought before producing the final answer), the
+    **last** match is preferred, as it is most likely to be the converged
+    solution rather than an intermediate draft.
+
+    Steps:
+    1. Fenced ```python … ``` block — last occurrence preferred.
     2. Generic ``` … ``` block that contains a function definition.
-    3. Bare ``def <name>(`` anywhere in the text — the model skipped fences
-       entirely but still wrote a proper function.
-    4. ``import numpy`` followed by a ``def`` — deepseek-r1 in thinking-only
-       mode sometimes produces syntactically valid code prefixed with numpy
-       imports but without a code fence or an immediate ``def``.
+    3. Bare ``def transform(`` — last occurrence preferred.
+    4. Any bare ``def <name>(`` — last occurrence.
+    5. ``import numpy`` followed by ``def`` (no fence at all).
 
     After extraction, _truncate_to_valid_function strips trailing prose that
-    reasoning models sometimes write after the ``return`` statement inside a
-    code fence.
+    reasoning models sometimes write after the ``return`` statement.
     """
-    # ── 1. ```python … ``` ──────────────────────────────────────────────────
-    m = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if m:
-        candidate = m.group(1).strip()
+    # Strip thinking tags first — idempotent if caller already stripped them,
+    # but essential when a raw-thinking response is passed directly.
+    text = _strip_thinking(text)
+    if not text.strip():
+        return None
+
+    # ── 1. ```python … ``` — last block preferred ───────────────────────────
+    matches = list(re.finditer(r"```python\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE))
+    if matches:
+        candidate = matches[-1].group(1).strip()
         return _truncate_to_valid_function(candidate) if "def " in candidate else candidate
 
-    # ── 2. ``` … ``` with a def ─────────────────────────────────────────────
-    m = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
-    if m:
+    # ── 2. ``` … ``` with a def — last qualifying block ─────────────────────
+    for m in reversed(list(re.finditer(r"```\s*(.*?)\s*```", text, re.DOTALL))):
         candidate = m.group(1).strip()
         if "def " in candidate:
             return _truncate_to_valid_function(candidate)
 
-    # ── 3. Bare def <name>( ─────────────────────────────────────────────────
-    m = re.search(r"def \w+\(", text)
-    if m:
-        return _truncate_to_valid_function(text[m.start():])
+    # ── 3. Bare def transform( — last occurrence ─────────────────────────────
+    # Prefer the specific function name to avoid capturing helper functions.
+    all_transforms = list(re.finditer(r"def transform\(", text))
+    if all_transforms:
+        return _truncate_to_valid_function(text[all_transforms[-1].start():])
 
-    # ── 4. import numpy … def (no fence) ────────────────────────────────────
-    # Some reasoning models write valid code starting with numpy imports but
-    # without a code fence.  _truncate_to_valid_function will skip the import
-    # lines and extract from the first def onwards; numpy is already in the
-    # sandbox namespace so the redundant import is harmless.
+    # ── 4. Any bare def — last occurrence ───────────────────────────────────
+    all_defs = list(re.finditer(r"def \w+\(", text))
+    if all_defs:
+        return _truncate_to_valid_function(text[all_defs[-1].start():])
+
+    # ── 5. import numpy … def (no fence) ────────────────────────────────────
+    # deepseek-r1 in thinking-only mode sometimes produces code starting with
+    # numpy imports but without a code fence.  numpy is pre-imported in the
+    # sandbox, so the redundant import is harmless.
     if "import numpy" in text and "def " in text:
-        start = text.find("import numpy")
+        start = text.rfind("import numpy")
         return _truncate_to_valid_function(text[start:])
 
     return None
@@ -327,49 +339,59 @@ class MultiAgent:
             - CODER route        → retry same hypothesis with feedback.
 
     Args:
-        backend:            'ollama' or 'anthropic'.
-        model:              Fallback model for any role that doesn't specify one.
-        hypothesizer_model: Model for the Hypothesizer role.
-        coder_model:        Model for the Coder role.
-        critic_model:       Model for the Critic role.
-        timeout:            Seconds to wait per LLM call (Ollama only).
-        debug:              Print diagnostic output to stdout.
-        max_cycles:         Maximum total agent calls before giving up.
+        backend:                  'ollama' or 'anthropic'.
+        model:                    Fallback model for any role that doesn't specify one.
+        hypothesizer_model:       Model for the Hypothesizer role.
+        coder_model:              Model for the Coder role.
+        critic_model:             Model for the Critic role.
+        hypothesizer_temperature: Sampling temperature for the Hypothesizer (default 0.6).
+        coder_temperature:        Base sampling temperature for the Coder (default 0.1).
+        critic_temperature:       Sampling temperature for the Critic (default 0.2).
+        timeout:                  Seconds to wait per LLM call (Ollama only).
+        debug:                    Print diagnostic output to stdout.
+        max_cycles:               Maximum total agent calls before giving up.
     """
 
     def __init__(
         self,
-        backend:            str        = "ollama",
-        model:              str | None = None,
-        hypothesizer_model: str | None = None,
-        coder_model:        str | None = None,
-        critic_model:       str | None = None,
-        timeout:            float      = 120.0,
-        debug:              bool       = False,
-        max_cycles:         int        = 9,
+        backend:                  str        = "ollama",
+        model:                    str | None = None,
+        hypothesizer_model:       str | None = None,
+        coder_model:              str | None = None,
+        critic_model:             str | None = None,
+        hypothesizer_temperature: float      = 0.6,
+        coder_temperature:        float      = 0.1,
+        critic_temperature:       float      = 0.2,
+        timeout:                  float      = 120.0,
+        debug:                    bool       = False,
+        max_cycles:               int        = 9,
     ) -> None:
-        def _make_client(role_model: str | None) -> LLMClient:
+        def _make_client(role_model: str | None, temperature: float) -> LLMClient:
             return LLMClient(
                 backend=backend,
                 model=role_model or model,
+                temperature=temperature,
                 timeout=timeout,
                 debug=debug,
             )
 
-        hyp_client = _make_client(hypothesizer_model)
-        cod_client = _make_client(coder_model)
-        cri_client = _make_client(critic_model)
+        hyp_client = _make_client(hypothesizer_model, hypothesizer_temperature)
+        cod_client = _make_client(coder_model,        coder_temperature)
+        cri_client = _make_client(critic_model,       critic_temperature)
 
-        self._hypothesizer      = Hypothesizer(hyp_client)
-        self._coder             = Coder(cod_client)
-        self._critic            = Critic(cri_client)
-        self.max_cycles         = max_cycles
-        self.debug              = debug
-        self.backend            = backend
-        self.hypothesizer_model = hyp_client.model
-        self.coder_model        = cod_client.model
-        self.critic_model       = cri_client.model
-        self.model              = self.hypothesizer_model  # primary / backward-compat alias
+        self._hypothesizer            = Hypothesizer(hyp_client)
+        self._coder                   = Coder(cod_client)
+        self._critic                  = Critic(cri_client)
+        self.max_cycles               = max_cycles
+        self.debug                    = debug
+        self.backend                  = backend
+        self.hypothesizer_model       = hyp_client.model
+        self.coder_model              = cod_client.model
+        self.critic_model             = cri_client.model
+        self.hypothesizer_temperature = hypothesizer_temperature
+        self.coder_temperature        = coder_temperature
+        self.critic_temperature       = critic_temperature
+        self.model                    = self.hypothesizer_model  # backward-compat alias
 
     # ------------------------------------------------------------------
     # Public API
@@ -440,8 +462,8 @@ class MultiAgent:
             current_hypothesis = hypotheses[hyp_index]
             coder_attempt += 1
 
-            # Temperature diversity: greedy on first attempt, ramp up on retries.
-            temperature = min((coder_attempt - 1) * 0.3, 0.8)
+            # Temperature diversity: start from role baseline, ramp up on retries.
+            temperature = min(self.coder_temperature + (coder_attempt - 1) * 0.3, 0.9)
 
             # --- Coder: translate hypothesis to code ---
             cycle += 1

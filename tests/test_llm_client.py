@@ -85,6 +85,14 @@ class TestLLMClientInit:
         client = LLMClient(backend="ollama", timeout=99.0)
         assert client._timeout == 99.0
 
+    def test_temperature_defaults_zero(self):
+        client = LLMClient(backend="ollama")
+        assert client.temperature == 0.0
+
+    def test_temperature_stored(self):
+        client = LLMClient(backend="ollama", temperature=0.6)
+        assert client.temperature == pytest.approx(0.6)
+
     def test_debug_defaults_false(self):
         client = LLMClient(backend="ollama")
         assert client.debug is False
@@ -240,6 +248,22 @@ class TestGenerateOllama:
             client.generate("sys", [{"role": "user", "content": "hi"}], temperature=0.7)
 
         assert captured["options"]["temperature"] == pytest.approx(0.7)
+
+    def test_stored_temperature_used_when_not_passed(self):
+        """When generate() is called without temperature, client.temperature is used."""
+        client = LLMClient(backend="ollama", temperature=0.6)
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            import json as _json
+            body = _json.loads(req.data.decode())
+            captured["options"] = body["options"]
+            return _ollama_stream("ok")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client.generate("sys", [{"role": "user", "content": "hi"}])
+
+        assert captured["options"]["temperature"] == pytest.approx(0.6)
 
 
 # ---------------------------------------------------------------------------
