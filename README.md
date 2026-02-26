@@ -1,6 +1,6 @@
 # ARC-AGI Solver
 
-A single-agent baseline for solving [ARC-AGI](https://arcprize.org/) (Abstraction and Reasoning Corpus) puzzles using large language models.
+A multi-agent system for solving [ARC-AGI](https://arcprize.org/) (Abstraction and Reasoning Corpus) puzzles using large language models.
 
 ## What is ARC-AGI?
 
@@ -23,10 +23,58 @@ Grids are 2-D arrays of integers 0–9, where each integer represents a colour:
 
 ## Approach
 
-The solver prompts an LLM to write a Python `transform` function, executes it against all training pairs, and iteratively feeds back pixel-level error details if any pair is wrong. This self-correction loop runs up to `max_retries` times with increasing temperature to encourage diverse solutions.
+Two solvers are implemented, sharing the same DSL and execution sandbox.
+
+### Multi-Agent System (primary)
+
+Three specialised agents collaborate in a state-machine loop:
+
+- **Hypothesizer** — studies the training grid pairs and proposes up to 3 competing natural-language transformation algorithms. Does not write code.
+- **Coder** — translates one hypothesis into an executable `transform(grid)` function using only the DSL primitives.
+- **Critic** — diagnoses failures and routes blame: either the logical rule was wrong (→ try next hypothesis) or the implementation had a bug (→ retry the same hypothesis with targeted feedback).
 
 ```
-Task prompt (training pairs + test input)
+                    ┌─────────────────────────────┐
+                    │        HYPOTHESIZING         │
+                    │  Hypothesizer proposes 1–3   │
+                    │  natural-language algorithms  │
+                    └──────────────┬───────────────┘
+                                   │  for each hypothesis
+                    ┌──────────────▼───────────────┐
+                    │           CODING             │
+                    │  Coder writes transform(grid) │◄─── Critic feedback (coder route)
+                    └──────────────┬───────────────┘
+                                   │
+                    ┌──────────────▼───────────────┐
+                    │          EVALUATING          │
+                    │  Run against all train pairs  │
+                    └──────┬───────────────────────┘
+                           │                       │
+                     all correct               some wrong
+                           │                       │
+               ┌───────────▼──────┐   ┌────────────▼────────────┐
+               │    CANDIDATE     │   │       CRITICIZING        │
+               │  solution saved  │   │  Critic diagnoses cause  │
+               └──────────────────┘   └─────┬──────────┬─────────┘
+                                            │          │
+                                     flawed rule    code bug
+                                            │          │
+                                      next hyp     retry Coder
+                                                  (↑ temperature)
+```
+
+**Stuck detection** — if a hypothesis produces 0 correct pairs across 2+ consecutive attempts, it is abandoned early without calling the Critic (the hypothesis is clearly wrong, not just poorly coded).
+
+**Training context** — the Coder receives the full set of training grid pairs alongside the hypothesis so it can verify its implementation mentally before returning code.
+
+**Temperature diversity** — the Coder's temperature ramps up with each retry (0.0 → 0.3 → 0.6) to encourage diverse implementations rather than identical repetitions of the same bug.
+
+### Single-Agent Baseline
+
+A simpler self-correction loop where one LLM writes code and re-tries with pixel-level error feedback. Used as a baseline and for quick experimentation.
+
+```
+Task prompt (training pairs)
         │
         ▼
    LLM generates def transform(grid) → grid
@@ -46,15 +94,22 @@ Task prompt (training pairs + test input)
 
 ```
 arc-agi/
-├── arc/                     # Core library
-│   ├── grid.py              # Grid type, task loading, utility functions
-│   ├── dsl.py               # Transformation primitives (DSL)
-│   ├── evaluate.py          # Evaluation harness and scoring
-│   └── visualize.py         # Terminal (ANSI) and matplotlib visualisation
+├── arc/                        # Core library (backend-agnostic)
+│   ├── grid.py                 # Grid type, task loading, utility functions
+│   ├── dsl.py                  # Transformation primitives (DSL)
+│   ├── sandbox.py              # Isolated subprocess execution of generated code
+│   ├── evaluate.py             # Evaluation harness and scoring
+│   └── visualize.py            # Terminal (ANSI) and matplotlib visualisation
 ├── agents/
-│   └── single_agent.py      # LLM-based solving agent
-├── tests/                   # pytest test suite
-├── run_baseline.py          # CLI entry point
+│   ├── llm_client.py           # Unified LLM backend (Ollama + Anthropic)
+│   ├── roles.py                # Hypothesizer, Coder, Critic agent roles
+│   ├── orchestrator.py         # State-machine orchestrator (primary solver)
+│   ├── multi_agent.py          # Cycle-based multi-agent loop (alternative)
+│   ├── ensemble.py             # Run multiple Orchestrators and vote
+│   └── single_agent.py         # Single-agent baseline
+├── tests/                      # pytest test suite (400 tests, ~92% coverage)
+├── data/                       # ARC dataset (400 training + 400 evaluation tasks)
+├── run_baseline.py             # CLI entry point for the single-agent baseline
 └── requirements.txt
 ```
 
@@ -67,19 +122,54 @@ pip install -r requirements.txt
 For the Anthropic backend, set your API key:
 
 ```bash
-echo "ANTHROPIC_API_KEY=sk-..." > .env
+export ANTHROPIC_API_KEY=sk-...
 ```
 
 For the Ollama backend, install [Ollama](https://ollama.com/) and pull a model:
 
 ```bash
-ollama pull deepseek-r1:32b
+ollama pull deepseek-r1:32b      # strong reasoning, best for Hypothesizer
+ollama pull qwen2.5-coder:7b     # fast, reliable code output, good for Coder
 ```
 
 ## Usage
 
+### Multi-Agent Orchestrator
+
+```python
+import json
+import numpy as np
+from agents.orchestrator import Orchestrator
+
+with open("data/data/training/007bbfb7.json") as f:
+    task = json.load(f)
+
+# Convert lists to numpy arrays
+for split in ("train", "test"):
+    for pair in task.get(split, []):
+        for key in ("input", "output"):
+            if key in pair:
+                pair[key] = np.array(pair[key], dtype=np.int32)
+
+orch = Orchestrator(
+    backend="ollama",
+    model="deepseek-r1:32b",
+    n_hypotheses=3,   # hypotheses to generate per cycle
+    max_retries=2,    # additional Coder attempts per hypothesis
+    timeout=300,      # seconds per LLM call
+    debug=True,
+)
+
+result = orch.solve(task)
+print(result["success"])      # True if any hypothesis passed all training pairs
+print(result["candidates"])   # all programs that passed training
+print(result["code"])         # best code found
+```
+
+### Single-Agent Baseline (CLI)
+
 ```bash
-# Solve a single task (Ollama/deepseek-r1 by default)
+# Solve a single task
 python run_baseline.py --task data/data/training/007bbfb7.json
 
 # Solve the first 20 tasks in a directory
@@ -95,7 +185,7 @@ python run_baseline.py --task data/data/training/007bbfb7.json --model qwen2.5-c
 python run_baseline.py --task data/data/training/007bbfb7.json --retries 5 --debug
 ```
 
-### CLI Options
+#### CLI Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -109,20 +199,13 @@ python run_baseline.py --task data/data/training/007bbfb7.json --retries 5 --deb
 | `--quiet` | off | Suppress per-task output |
 | `--debug` | off | Print raw model responses |
 
-Results are saved as JSON under `logs/`, including the per-attempt code and error traces for every task.
-
-Two accuracy metrics are reported:
-
-| Metric | Description |
-|--------|-------------|
-| `train_solved` | Tasks where the generated function passes **all training pairs** — an optimistic upper bound (a function that hardcodes the training examples would score 100%). |
-| `test_correct` | Tasks where the function produces the exact right answer on the **held-out test input** — the honest accuracy metric. Only available for the training split (which includes test ground truth). |
+Results are saved as JSON under `logs/`.
 
 ## Implementation Details
 
 ### DSL (`arc/dsl.py`)
 
-To give the model a useful vocabulary, every generated function runs inside a namespace pre-populated with transformation primitives — no imports needed. All primitives are pure (immutable: they return a new array rather than mutating the input).
+Generated functions run inside a namespace pre-populated with transformation primitives — no imports needed. All primitives return new arrays (immutable).
 
 | Primitive | Description |
 |-----------|-------------|
@@ -140,24 +223,51 @@ To give the model a useful vocabulary, every generated function runs inside a na
 | `bounding_box(grid, color)` | Tight bounding box of a colour or all foreground |
 | `crop_to_content(grid)` | Crop to the bounding box of non-background content |
 
-### Agent (`agents/single_agent.py`)
+`numpy` is also available as `np` inside every generated function.
 
-**Prompt construction** — Training pairs are serialised as Python list literals. For tasks with very large grids (> 300 total cells per pair), the number of pairs shown is capped at 2 to stay within context limits. When the output is an exact N×M tiling of input-sized blocks, a pre-computed block analysis is appended to help the model spot the pattern.
+### Execution Sandbox (`arc/sandbox.py`)
 
-**Code extraction** — Model responses are searched for fenced `` ```python `` blocks. The *last* syntactically-valid block containing a `def` is used (reasoning models often draft multiple versions and refine toward the end). If trailing prose corrupts the block, it is trimmed line-by-line via AST validation. Blocks containing no function definition (e.g. grid literals) are rejected. A bare `def` outside any fence is used as a last resort.
+Generated code runs in an isolated child process (`multiprocessing.Process`) that is force-killed after 10 seconds. The child's namespace contains only the DSL primitives and numpy — no file system, network, or `input()` access. Code that references `sys.stdin` or `input` is rejected before the subprocess is even spawned.
 
-**Execution sandbox** — Generated code runs in a child process spawned via `multiprocessing.Process`, isolated from the parent. The child is forcibly killed if it has not finished within 10 seconds, preventing infinite loops from hanging the solver. Inside the child, code runs under `exec()` in a namespace seeded with the DSL and numpy; `stdout` is suppressed. Code that references `input()` or `sys.stdin` is rejected before the subprocess is even spawned. If the model names its function something other than `transform`, the last user-defined callable in the namespace is used as a fallback.
+### LLM Client (`agents/llm_client.py`)
 
-**Self-correction loop** — On each failed attempt, the agent sends back a message listing which pairs were wrong, the full expected and predicted grids, and a cell-level diff (coordinates + colour names). The temperature schedule is `[0.0, 0.4, 0.8, 1.0]` — greedy on the first try, increasingly random on retries.
+A thin backend-agnostic wrapper that all agents call via `generate(system_prompt, messages, temperature)`.
 
-**Backends:**
+- **Ollama** — streams NDJSON from the local `/api/chat` endpoint via `urllib`. Thinking tokens from extended-reasoning models (e.g. `deepseek-r1`) arrive in a separate `thinking` field; when content is non-empty, they are wrapped in `<think>…</think>` and prepended so callers can strip them uniformly. When content is empty (the model placed its entire response in the thinking field), the raw thinking is returned without tags so code extractors can still find `def transform` or ` ```python ` blocks within it.
+- **Anthropic** — uses the `anthropic` SDK with a single non-streaming call.
 
-- **Ollama** — Calls the local Ollama `/api/chat` endpoint via `urllib` with streaming NDJSON. Exits the stream early once a complete code block is detected. Recovers partial results if the wall-clock deadline fires mid-stream. Thinking tokens from extended-reasoning models (e.g. deepseek-r1) are collected separately, wrapped in `<think>` tags, and stripped before code extraction.
-- **Anthropic** — Uses the `anthropic` SDK with a single non-streaming call (`max_tokens=8192`).
+Default models: `deepseek-r1:32b` (Ollama), `claude-sonnet-4-6` (Anthropic).
 
-### Evaluation (`arc/evaluate.py`)
+### Agent Roles (`agents/roles.py`)
 
-`evaluate_task(task, transform_fn)` applies a function to every training pair, catching exceptions per-pair, and returns correctness stats. `score_all(tasks_dir, transform_fn)` runs this across a directory and reports task-level accuracy (all pairs correct) and pair-level accuracy separately.
+| Role | Responsibility |
+|------|---------------|
+| `Hypothesizer` | Proposes 3 distinct natural-language transformation algorithms from the training pairs. Never writes code. |
+| `Coder` | Translates one hypothesis into a `def transform(grid)` function using DSL primitives. Accepts Critic feedback and training examples for context. |
+| `Critic` | Analyzes a failed attempt (hypothesis + code + error + pixel diff) and routes blame: `ROUTE: HYPOTHESIZER` (wrong logic) or `ROUTE: CODER` (implementation bug). |
+
+### Hypothesis Parsing
+
+The Hypothesizer's response is parsed with a three-layer strategy tuned for reasoning models that embed numbered lists inside their chain-of-thought:
+
+1. **Paragraph-level split** — preferred; only captures items that begin a blank-line-separated paragraph with a digit+period, avoiding sub-steps inside prose.
+2. **Line-level split** — fallback for models that don't add blank lines between hypotheses.
+3. **Noise filter** — items shorter than 80 characters are discarded as reasoning fragments, not full algorithm descriptions.
+
+Results are capped at `n_hypotheses` (default 3).
+
+### Orchestrator (`agents/orchestrator.py`)
+
+The `Orchestrator` is the primary solver. It owns task state and drives a two-level loop:
+
+- **Outer loop** — one pass per hypothesis produced by the Hypothesizer.
+- **Inner loop** — up to `max_retries + 1` Coder attempts per hypothesis.
+
+A `CANDIDATE` is recorded whenever code passes all training pairs; the outer loop continues to find additional candidates from remaining hypotheses.
+
+### Ensemble (`agents/ensemble.py`)
+
+`Ensemble` runs multiple independent `Orchestrator` instances on the same task and selects the output by majority vote. Useful when a single run is unreliable.
 
 ## Running Tests
 
@@ -165,8 +275,4 @@ To give the model a useful vocabulary, every generated function runs inside a na
 pytest tests/
 ```
 
-The test suite covers:
-- Grid utilities and DSL primitives (unit tests with numpy assertions)
-- Evaluation harness (correct/wrong/exception cases, scoring)
-- Visualisation (terminal output captured with `capsys`, matplotlib mocked)
-- Agent internals (code extraction edge cases, Ollama streaming mocked via `urllib`, end-to-end solve loop with mocked Anthropic API)
+400 tests covering DSL primitives, sandbox execution, LLM client streaming, all three agent roles, orchestrator state transitions, ensemble voting, and the single-agent baseline. Network calls are fully mocked.
