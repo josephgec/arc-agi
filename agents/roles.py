@@ -139,6 +139,24 @@ Translate the given natural-language transformation rule into a Python function.
 
 {dsl_docs}
 
+CRITICAL WARNING — AVOID SEQUENTIAL OVERWRITE BUGS:
+When swapping colors or applying multiple color rules, NEVER mutate the grid
+sequentially. Doing so will accidentally overwrite your previous changes.
+
+BAD (causes overlap — the second line modifies cells just set by the first):
+    grid[grid == 1] = 2
+    grid[grid == 2] = 1  # Wrong: also changes the 1s that were just set to 2
+
+GOOD — use a copy so the source values are frozen before any writes:
+    new_grid = np.copy(grid)
+    new_grid[grid == 1] = 2
+    new_grid[grid == 2] = 1
+
+GOOD — use np.select to build the result in one vectorised step:
+    conditions = [grid == 1, grid == 2]
+    choices    = [2, 1]
+    new_grid   = np.select(conditions, choices, default=grid)
+
 Output ONLY a single ```python code block containing the transform(grid) function.
 Do not include any explanation, prose, or additional text outside the code block.\
 """
