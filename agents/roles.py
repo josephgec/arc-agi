@@ -134,8 +134,10 @@ class Coder:
     """
 
     _SYSTEM_PROMPT_TEMPLATE = """\
-You are an expert Python translation engine for ARC puzzles.
-Translate the given natural-language transformation rule into a Python function.
+You are a Python code generator for ARC-AGI puzzles.
+
+You will be given a natural-language transformation rule.
+Implement it immediately as a Python function. Start your response with ```python.
 
 {dsl_docs}
 
@@ -157,8 +159,7 @@ GOOD — use np.select to build the result in one vectorised step:
     choices    = [2, 1]
     new_grid   = np.select(conditions, choices, default=grid)
 
-Output ONLY a single ```python code block containing the transform(grid) function.
-Do not include any explanation, prose, or additional text outside the code block.\
+Output ONLY the ```python code block. No explanation. No commentary. No prose.\
 """
 
     def __init__(self, client: LLMClient) -> None:
@@ -176,11 +177,19 @@ Do not include any explanation, prose, or additional text outside the code block
 
         Args:
             hypothesis:       Natural-language transformation algorithm to implement.
+                              Any <think>…</think> blocks are stripped before the
+                              hypothesis is sent so reasoning-model chain-of-thought
+                              from the Hypothesizer never reaches the Coder.
             feedback:         Optional Critic feedback from a previous failed attempt.
             training_context: Optional formatted training pairs shown after the
                               hypothesis so the Coder can verify its implementation.
             temperature:      Sampling temperature (0 = greedy; raise for retries).
         """
+        # Strip <think>…</think> blocks that a reasoning Hypothesizer may have
+        # emitted.  qwen2.5-coder doesn't need the chain-of-thought — it only
+        # needs the clean, structured algorithm description.
+        hypothesis = _strip_thinking(hypothesis)
+
         base = f"Hypothesis to implement:\n\n{hypothesis}"
         if training_context:
             base = f"{base}\n\n{training_context}"

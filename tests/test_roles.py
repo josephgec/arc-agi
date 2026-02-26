@@ -126,6 +126,32 @@ class TestCoder:
         content = client.generate.call_args[0][1][0]["content"]
         assert "Fix" in content or "fix" in content
 
+    def test_think_tags_stripped_from_hypothesis(self):
+        """<think> blocks from a reasoning Hypothesizer must not reach the Coder."""
+        client = _mock_client()
+        c = Coder(client)
+        c.generate("<think>chain of thought</think>Replace color 1 with 2.")
+        content = client.generate.call_args[0][1][0]["content"]
+        assert "<think>" not in content
+        assert "chain of thought" not in content
+        assert "Replace color 1 with 2." in content
+
+    def test_system_prompt_no_prose_instruction(self):
+        """Prompt must explicitly ban explanation and commentary."""
+        client = _mock_client()
+        c = Coder(client)
+        c.generate("hypothesis")
+        sp = client.generate.call_args[0][0]
+        assert "No explanation" in sp or "no explanation" in sp.lower()
+
+    def test_system_prompt_instructs_start_with_code_fence(self):
+        """Prompt must tell the model to start immediately with ```python."""
+        client = _mock_client()
+        c = Coder(client)
+        c.generate("hypothesis")
+        sp = client.generate.call_args[0][0]
+        assert "```python" in sp
+
 
 # ---------------------------------------------------------------------------
 # Critic
