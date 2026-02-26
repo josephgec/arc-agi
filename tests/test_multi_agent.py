@@ -100,6 +100,38 @@ class TestExtractCode:
         code = _extract_code(text)
         assert "return grid.copy()" in code
 
+    def test_python_block_no_newline_after_fence(self):
+        """Model emits code on same line as opening fence (token-limit artefact)."""
+        text = "```python def transform(grid):\n    return grid\n```"
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+
+    def test_python_block_extra_whitespace_after_fence(self):
+        """Blank line between opening fence and def is still matched."""
+        text = "```python\n\ndef transform(grid):\n    return grid\n```"
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+
+    def test_import_numpy_fallback(self):
+        """No fence, but valid code starting with numpy import is extracted."""
+        text = (
+            "Here is my solution:\n"
+            "import numpy as np\n"
+            "def transform(grid):\n"
+            "    return np.where(grid == 1, 2, grid).astype(np.int32)\n"
+        )
+        code = _extract_code(text)
+        assert code is not None
+        assert "def transform" in code
+        assert "np.where" in code
+
+    def test_import_numpy_without_def_returns_none(self):
+        """import numpy alone (no def) must not trigger the fallback."""
+        text = "You could use import numpy as np to solve this."
+        assert _extract_code(text) is None
+
 
 # ---------------------------------------------------------------------------
 # _parse_hypotheses

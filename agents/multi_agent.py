@@ -150,25 +150,52 @@ def _truncate_to_valid_function(text: str) -> str:
 
 
 def _extract_code(text: str) -> str | None:
-    """Extract the first ```python block from text. Falls back to bare def.
+    """Extract executable Python code from a model response.
 
-    After extraction, trailing prose that leaked inside the code fence
-    (a common artefact of reasoning models) is removed by
-    _truncate_to_valid_function so the sandbox never sees a SyntaxError
-    caused by the model explaining its own code after the return statement.
+    Four-step cascade with increasing tolerance for missing formatting:
+
+    1. Fenced ```python … ``` block.  Uses ``\\s*`` (not ``\\n``) so code that
+       appears on the same line as the opening fence is still captured — a
+       common artefact when a model runs close to its token limit and omits the
+       newline.
+    2. Generic ``` … ``` block that contains a function definition.
+    3. Bare ``def <name>(`` anywhere in the text — the model skipped fences
+       entirely but still wrote a proper function.
+    4. ``import numpy`` followed by a ``def`` — deepseek-r1 in thinking-only
+       mode sometimes produces syntactically valid code prefixed with numpy
+       imports but without a code fence or an immediate ``def``.
+
+    After extraction, _truncate_to_valid_function strips trailing prose that
+    reasoning models sometimes write after the ``return`` statement inside a
+    code fence.
     """
-    m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
+    # ── 1. ```python … ``` ──────────────────────────────────────────────────
+    m = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         candidate = m.group(1).strip()
         return _truncate_to_valid_function(candidate) if "def " in candidate else candidate
-    m = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
+
+    # ── 2. ``` … ``` with a def ─────────────────────────────────────────────
+    m = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
     if m:
         candidate = m.group(1).strip()
         if "def " in candidate:
             return _truncate_to_valid_function(candidate)
-    m = re.search(r"(def \w+\(.*)", text)
+
+    # ── 3. Bare def <name>( ─────────────────────────────────────────────────
+    m = re.search(r"def \w+\(", text)
     if m:
         return _truncate_to_valid_function(text[m.start():])
+
+    # ── 4. import numpy … def (no fence) ────────────────────────────────────
+    # Some reasoning models write valid code starting with numpy imports but
+    # without a code fence.  _truncate_to_valid_function will skip the import
+    # lines and extract from the first def onwards; numpy is already in the
+    # sandbox namespace so the redundant import is harmless.
+    if "import numpy" in text and "def " in text:
+        start = text.find("import numpy")
+        return _truncate_to_valid_function(text[start:])
+
     return None
 
 
