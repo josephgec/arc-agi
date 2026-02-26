@@ -32,15 +32,15 @@ Grids are 2-D arrays of integers 0–9, where each integer represents a colour:
  │  ┌────────────────┐   think tags   ┌─────────────────┐  │
  │  │  Hypothesizer  │ ─────stripped──►     Coder        │  │
  │  │                │                │                  │  │
- │  │ deepseek-r1    │  clean rule    │ qwen2.5-coder   │  │
+ │  │ deepseek-r1:32b│  clean rule    │ qwen2.5-coder:14b│ │
  │  │ (reasoning)    │ ─────────────► │ (code-focused)  │  │
  │  └────────────────┘                └────────┬────────┘  │
  │                                             │ code       │
  │  ┌────────────────┐   route+feedback  ┌────▼────────┐   │
  │  │     Critic     │ ◄─────────────────│  Sandbox    │   │
  │  │                │                   │  Evaluator  │   │
- │  │ deepseek-r1    │                   └─────────────┘   │
- │  │ (reasoning)    │                                      │
+ │  │ qwen2.5-coder  │                   └─────────────┘   │
+ │  │ :14b (shared)  │                                      │
  │  └────────────────┘                                      │
  └──────────────────────────────────────────────────────────┘
 ```
@@ -214,15 +214,16 @@ A simpler self-correction loop used as a comparison baseline.
 
 Each agent role has a different cognitive requirement, so a different model type is optimal:
 
-| Role | Best Model Type | Example | Why |
-|------|----------------|---------|-----|
-| **Hypothesizer** | Reasoning / thinking | `deepseek-r1:32b` | Needs spatial pattern analysis and lateral thinking across grid examples |
-| **Coder** | Code-focused | `qwen2.5-coder:7b` | Needs reliable `\`\`\`python` output, not reasoning; small + fast |
-| **Critic** | Reasoning | `deepseek-r1:8b` | Needs to diagnose logic vs. implementation bugs from diffs |
+| Role | Model | Q4_K_M RAM | Why |
+|------|-------|-----------|-----|
+| **Hypothesizer** | `deepseek-r1:32b` | ~20 GB | Distilled-Qwen reasoning model; best open-weight spatial reasoning at this size |
+| **Coder** | `qwen2.5-coder:14b` | ~9 GB | Instruction-following code gen; 14b vs 7b cuts syntax/indentation errors; never wastes tokens "thinking" |
+| **Critic** | `qwen2.5-coder:14b` | ~0 GB | Reuses the already-loaded Coder model slot — saves 9 GB vs a separate reasoning model |
+| **Total** | | **~29 GB** | Leaves ~19 GB headroom on a 48 GB machine for context windows and macOS |
 
 The Coder prompt is intentionally **non-reasoning**: it opens with "Implement it immediately. Start with ` ```python `." No "think step by step." The reasoning has already been done by the Hypothesizer; the Coder's job is pure translation.
 
-The Hypothesizer's `<think>` chain-of-thought is **stripped** before being handed to the Coder — the small coding model only sees the clean, structured algorithm description.
+The Hypothesizer's `<think>` chain-of-thought is **stripped** before being handed to the Coder — the coding model only sees the clean, structured algorithm description.
 
 ---
 
@@ -247,6 +248,7 @@ arc-agi/
 ├── data/                       # ARC dataset (400 training + 400 evaluation tasks)
 ├── run_multi_agent.py          # CLI for the multi-agent Orchestrator
 ├── run_baseline.py             # CLI for the single-agent baseline
+├── start_ollama.sh             # Launch Ollama with OLLAMA_NUM_PARALLEL=3 (Mac Studio)
 └── requirements.txt
 ```
 
@@ -267,10 +269,25 @@ export ANTHROPIC_API_KEY=sk-...
 For the Ollama backend, install [Ollama](https://ollama.com/) and pull models:
 
 ```bash
-ollama pull deepseek-r1:32b      # Hypothesizer + Critic (reasoning)
-ollama pull deepseek-r1:8b       # Critic (lighter option)
-ollama pull qwen2.5-coder:7b     # Coder (fast, code-focused)
+ollama pull deepseek-r1:32b       # Hypothesizer — ~20 GB Q4_K_M
+ollama pull qwen2.5-coder:14b     # Coder + Critic — ~9 GB Q4_K_M
 ```
+
+#### Mac Studio — concurrent model loading
+
+To keep all models resident simultaneously (no cold-load delays mid-solve), set these variables before starting Ollama:
+
+```bash
+# Either source the helper script (exports vars + starts the server):
+source start_ollama.sh
+
+# Or set manually:
+export OLLAMA_NUM_PARALLEL=3
+export OLLAMA_MAX_VRAM=51539607552   # 48 GiB in bytes
+ollama serve
+```
+
+`OLLAMA_NUM_PARALLEL=3` keeps one slot per role model loaded. `OLLAMA_MAX_VRAM` pins the ceiling to 48 GB of unified RAM so Ollama never spills to swap.
 
 ---
 
@@ -279,20 +296,18 @@ ollama pull qwen2.5-coder:7b     # Coder (fast, code-focused)
 ### Multi-Agent Orchestrator (CLI)
 
 ```bash
-# Recommended: per-role models
+# Default loadout — deepseek-r1:32b Hypothesizer + qwen2.5-coder:14b Coder/Critic
+python run_multi_agent.py --task data/data/training/007bbfb7.json
+
+# Run over a directory (reports train-solved + test-correct rates)
+python run_multi_agent.py --dir data/data/training --limit 20
+
+# Override individual roles
 python run_multi_agent.py \
     --task data/data/training/007bbfb7.json \
     --hypothesizer-model deepseek-r1:32b \
-    --coder-model qwen2.5-coder:7b \
-    --critic-model deepseek-r1:8b
-
-# Run over a directory (reports train-solved + test-correct rates)
-python run_multi_agent.py \
-    --dir data/data/training \
-    --limit 20 \
-    --hypothesizer-model deepseek-r1:32b \
-    --coder-model qwen2.5-coder:7b \
-    --critic-model deepseek-r1:8b
+    --coder-model qwen2.5-coder:14b \
+    --critic-model deepseek-r1:14b   # separate reasoning critic (costs +9 GB)
 
 # Single model for all roles (quick experiments)
 python run_multi_agent.py \
@@ -313,10 +328,10 @@ python run_multi_agent.py \
 | `--dir DIR` | — | Directory of task JSON files |
 | `--limit N` | none | Max tasks to run (directory mode) |
 | `--backend` | `ollama` | `ollama` or `anthropic` |
-| `--model` | backend default | Fallback model for all roles |
-| `--hypothesizer-model` | `--model` | Model for the Hypothesizer |
-| `--coder-model` | `--model` | Model for the Coder |
-| `--critic-model` | `--model` | Model for the Critic |
+| `--model` | — | Fallback model for any unset role |
+| `--hypothesizer-model` | `deepseek-r1:32b` | Model for the Hypothesizer |
+| `--coder-model` | `qwen2.5-coder:14b` | Model for the Coder |
+| `--critic-model` | `qwen2.5-coder:14b` | Model for the Critic |
 | `--n-hypotheses N` | `3` | Hypotheses to generate per task |
 | `--max-retries N` | `2` | Extra Coder attempts per hypothesis |
 | `--timeout SECS` | `300` | Seconds per LLM call (Ollama) |
@@ -341,9 +356,9 @@ for split in ("train", "test"):
 
 orch = Orchestrator(
     backend="ollama",
-    hypothesizer_model="deepseek-r1:32b",   # reasoning model
-    coder_model="qwen2.5-coder:7b",          # coding model
-    critic_model="deepseek-r1:8b",           # reasoning model
+    hypothesizer_model="deepseek-r1:32b",    # reasoning model
+    coder_model="qwen2.5-coder:14b",         # coding model
+    critic_model="qwen2.5-coder:14b",        # reuse Coder slot — saves 9 GB
     n_hypotheses=3,
     max_retries=2,
     timeout=300,

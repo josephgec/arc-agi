@@ -1,29 +1,32 @@
 """CLI for the multi-agent Orchestrator on ARC-AGI tasks.
 
-Each agent role (Hypothesizer, Coder, Critic) can use a different model,
-which is the key advantage over the single-agent baseline.  A strong
-reasoning model handles hypothesis generation while a coding-focused model
-handles implementation — matching model strengths to task requirements.
+Each agent role (Hypothesizer, Coder, Critic) uses a different model,
+matching model strengths to task requirements.
+
+Default loadout (optimised for 48 GB unified memory, ~29 GB footprint):
+  Hypothesizer  deepseek-r1:32b        ~20 GB  — distilled Qwen reasoning model
+  Coder         qwen2.5-coder:14b       ~9 GB  — instruction-following code gen
+  Critic        qwen2.5-coder:14b       ~0 GB  — reuses the Coder model slot
+
+Start Ollama with enough parallelism for concurrent model loading:
+  source start_ollama.sh   # sets OLLAMA_NUM_PARALLEL=3, OLLAMA_MAX_VRAM
 
 Examples
 --------
-# Run with default model for all roles
+# Single task with default models
 python run_multi_agent.py --task data/data/training/007bbfb7.json
 
-# Use per-role models (recommended)
+# Explicit per-role models
 python run_multi_agent.py \\
     --task data/data/training/007bbfb7.json \\
     --hypothesizer-model deepseek-r1:32b \\
-    --coder-model qwen2.5-coder:7b \\
-    --critic-model deepseek-r1:8b
+    --coder-model qwen2.5-coder:14b \\
+    --critic-model qwen2.5-coder:14b
 
 # Run over a directory, limit to 20 tasks
 python run_multi_agent.py \\
     --dir data/data/training \\
-    --limit 20 \\
-    --hypothesizer-model deepseek-r1:32b \\
-    --coder-model qwen2.5-coder:7b \\
-    --critic-model deepseek-r1:8b
+    --limit 20
 """
 from __future__ import annotations
 
@@ -74,20 +77,22 @@ def _parse_args() -> argparse.Namespace:
         help="Default model for all roles (overridden by per-role flags).",
     )
     p.add_argument(
-        "--hypothesizer-model", default=None, dest="hypothesizer_model",
-        metavar="MODEL",
+        "--hypothesizer-model", default="deepseek-r1:32b",
+        dest="hypothesizer_model", metavar="MODEL",
         help="Model for the Hypothesizer (spatial reasoning).  "
-             "Recommended: deepseek-r1:32b.",
+             "Default: deepseek-r1:32b (~20 GB Q4_K_M).",
     )
     p.add_argument(
-        "--coder-model", default=None, dest="coder_model", metavar="MODEL",
+        "--coder-model", default="qwen2.5-coder:14b",
+        dest="coder_model", metavar="MODEL",
         help="Model for the Coder (code generation).  "
-             "Recommended: qwen2.5-coder:7b.",
+             "Default: qwen2.5-coder:14b (~9 GB Q4_K_M).",
     )
     p.add_argument(
-        "--critic-model", default=None, dest="critic_model", metavar="MODEL",
+        "--critic-model", default="qwen2.5-coder:14b",
+        dest="critic_model", metavar="MODEL",
         help="Model for the Critic (failure diagnosis).  "
-             "Recommended: deepseek-r1:8b.",
+             "Default: qwen2.5-coder:14b — reuses the Coder slot, saving ~9 GB.",
     )
 
     # Orchestrator tuning
