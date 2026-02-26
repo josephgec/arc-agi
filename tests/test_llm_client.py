@@ -93,6 +93,14 @@ class TestLLMClientInit:
         client = LLMClient(backend="ollama", temperature=0.6)
         assert client.temperature == pytest.approx(0.6)
 
+    def test_max_tokens_default(self):
+        client = LLMClient(backend="ollama")
+        assert client.max_tokens == 32768
+
+    def test_max_tokens_stored(self):
+        client = LLMClient(backend="ollama", max_tokens=8192)
+        assert client.max_tokens == 8192
+
     def test_debug_defaults_false(self):
         client = LLMClient(backend="ollama")
         assert client.debug is False
@@ -265,6 +273,22 @@ class TestGenerateOllama:
 
         assert captured["options"]["temperature"] == pytest.approx(0.6)
 
+    def test_max_tokens_forwarded_as_num_predict(self):
+        """max_tokens must be sent to Ollama as options.num_predict."""
+        client = LLMClient(backend="ollama", max_tokens=8192)
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            import json as _json
+            body = _json.loads(req.data.decode())
+            captured["options"] = body["options"]
+            return _ollama_stream("ok")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client.generate("sys", [{"role": "user", "content": "hi"}])
+
+        assert captured["options"]["num_predict"] == 8192
+
 
 # ---------------------------------------------------------------------------
 # generate() — Anthropic backend (SDK mocked)
@@ -317,3 +341,13 @@ class TestGenerateAnthropic:
         client.generate("sys", [{"role": "user", "content": "hi"}], temperature=0.4)
         call_kwargs = client._anthropic.messages.create.call_args.kwargs
         assert call_kwargs["temperature"] == pytest.approx(0.4)
+
+    def test_max_tokens_passed_to_api(self):
+        """max_tokens must be forwarded to the Anthropic API."""
+        with patch("anthropic.Anthropic"):
+            client = LLMClient(backend="anthropic", max_tokens=8192)
+        client._anthropic = MagicMock()
+        client._anthropic.messages.create.return_value = self._mock_api_response("x")
+        client.generate("sys", [{"role": "user", "content": "hi"}])
+        call_kwargs = client._anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 8192

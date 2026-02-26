@@ -40,11 +40,17 @@ class LLMClient:
     models).
 
     Args:
-        backend:  "ollama" or "anthropic".
-        model:    Model name override.  Defaults to deepseek-r1:32b /
-                  claude-sonnet-4-6 depending on backend.
-        timeout:  Seconds to wait for a model response (Ollama only).
-        debug:    Print response length diagnostics to stdout.
+        backend:    "ollama" or "anthropic".
+        model:      Model name override.  Defaults to deepseek-r1:32b /
+                    claude-sonnet-4-6 depending on backend.
+        temperature: Default sampling temperature.  Overridden per-call when needed.
+        max_tokens: Maximum tokens to generate.  Set low for the Coder (8192 — it only
+                    outputs code, not reasoning) and high for the Hypothesizer/Critic
+                    (32768 — they need space for extended thinking chains).
+                    This maps to ``num_predict`` in Ollama and ``max_tokens`` in the
+                    Anthropic API.
+        timeout:    Seconds to wait for a model response (Ollama only).
+        debug:      Print response length diagnostics to stdout.
     """
 
     def __init__(
@@ -52,12 +58,14 @@ class LLMClient:
         backend: str = "ollama",
         model: str | None = None,
         temperature: float = 0.0,
+        max_tokens: int = 32768,
         timeout: float = 120.0,
         debug: bool = False,
     ) -> None:
         self.debug       = debug
         self._timeout    = timeout
         self.temperature = temperature  # role-specific default; overridden per-call when needed
+        self.max_tokens  = max_tokens   # token budget: low for Coder, high for Hypothesizer/Critic
 
         if backend == "ollama":
             self.backend = "ollama"
@@ -111,7 +119,7 @@ class LLMClient:
         """Send a request to the Anthropic API and return the response text."""
         response = self._anthropic.messages.create(
             model=self.model,
-            max_tokens=8192,
+            max_tokens=self.max_tokens,
             system=system_prompt,
             messages=messages,
             temperature=temperature,
@@ -155,7 +163,7 @@ class LLMClient:
             "stream":   True,
             "options":  {
                 "temperature": temperature,
-                "num_predict": 32000,
+                "num_predict": self.max_tokens,
             },
         }).encode()
 

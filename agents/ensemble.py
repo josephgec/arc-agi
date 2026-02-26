@@ -132,6 +132,9 @@ class Ensemble:
         hypothesizer_temperature: float      = 0.6,
         coder_temperature:        float      = 0.1,
         critic_temperature:       float      = 0.2,
+        hypothesizer_max_tokens:  int        = 32768,
+        coder_max_tokens:         int        = 8192,
+        critic_max_tokens:        int        = 16384,
         timeout:                  float      = 120.0,
         debug:                    bool       = False,
         target_candidates:        int        = 3,
@@ -148,6 +151,9 @@ class Ensemble:
             hypothesizer_temperature=hypothesizer_temperature,
             coder_temperature=coder_temperature,
             critic_temperature=critic_temperature,
+            hypothesizer_max_tokens=hypothesizer_max_tokens,
+            coder_max_tokens=coder_max_tokens,
+            critic_max_tokens=critic_max_tokens,
             timeout=timeout,
             debug=debug,
             n_hypotheses=n_hypotheses,
@@ -163,6 +169,9 @@ class Ensemble:
         self.hypothesizer_temperature = self._orchestrator.hypothesizer_temperature
         self.coder_temperature        = self._orchestrator.coder_temperature
         self.critic_temperature       = self._orchestrator.critic_temperature
+        self.hypothesizer_max_tokens  = self._orchestrator.hypothesizer_max_tokens
+        self.coder_max_tokens         = self._orchestrator.coder_max_tokens
+        self.critic_max_tokens        = self._orchestrator.critic_max_tokens
         self.model                    = self._orchestrator.model
 
     # ------------------------------------------------------------------

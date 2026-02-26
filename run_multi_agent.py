@@ -112,6 +112,23 @@ def _parse_args() -> argparse.Namespace:
         help="Sampling temperature for the Critic (default 0.2 — nuanced analysis).",
     )
 
+    # Per-role token budgets
+    p.add_argument(
+        "--hypothesizer-max-tokens", type=int, default=32768,
+        dest="hypothesizer_max_tokens", metavar="N",
+        help="Max tokens for Hypothesizer (default 32768 — needs long reasoning chains).",
+    )
+    p.add_argument(
+        "--coder-max-tokens", type=int, default=8192,
+        dest="coder_max_tokens", metavar="N",
+        help="Max tokens for Coder (default 8192 — code only, no reasoning overhead).",
+    )
+    p.add_argument(
+        "--critic-max-tokens", type=int, default=16384,
+        dest="critic_max_tokens", metavar="N",
+        help="Max tokens for Critic (default 16384 — analysis + routing feedback).",
+    )
+
     # Orchestrator tuning
     p.add_argument(
         "--n-hypotheses", type=int, default=3, dest="n_hypotheses",
@@ -191,6 +208,9 @@ def main() -> None:
         hypothesizer_temperature=args.hypothesizer_temperature,
         coder_temperature=args.coder_temperature,
         critic_temperature=args.critic_temperature,
+        hypothesizer_max_tokens=args.hypothesizer_max_tokens,
+        coder_max_tokens=args.coder_max_tokens,
+        critic_max_tokens=args.critic_max_tokens,
         n_hypotheses=args.n_hypotheses,
         max_retries=args.max_retries,
         timeout=args.timeout,
@@ -198,9 +218,9 @@ def main() -> None:
     )
 
     print(f"Backend:  {orch.backend}")
-    print(f"  Hypothesizer: {orch.hypothesizer_model}  (temp={orch.hypothesizer_temperature})")
-    print(f"  Coder:        {orch.coder_model}  (temp={orch.coder_temperature})")
-    print(f"  Critic:       {orch.critic_model}  (temp={orch.critic_temperature})")
+    print(f"  Hypothesizer: {orch.hypothesizer_model}  (temp={orch.hypothesizer_temperature}, max_tokens={orch.hypothesizer_max_tokens})")
+    print(f"  Coder:        {orch.coder_model}  (temp={orch.coder_temperature}, max_tokens={orch.coder_max_tokens})")
+    print(f"  Critic:       {orch.critic_model}  (temp={orch.critic_temperature}, max_tokens={orch.critic_max_tokens})")
     print(f"  n_hypotheses={orch.n_hypotheses}  max_retries={orch.max_retries}")
 
     if args.task:

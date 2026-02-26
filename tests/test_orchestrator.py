@@ -184,6 +184,22 @@ class TestOrchestratorInit:
         assert orch.coder_temperature        == pytest.approx(0.0)
         assert orch.critic_temperature       == pytest.approx(0.5)
 
+    def test_max_tokens_defaults(self):
+        orch = self._make()
+        assert orch.hypothesizer_max_tokens == 32768
+        assert orch.coder_max_tokens        == 8192
+        assert orch.critic_max_tokens       == 16384
+
+    def test_max_tokens_overrides_stored(self):
+        orch = self._make(
+            hypothesizer_max_tokens=16000,
+            coder_max_tokens=4096,
+            critic_max_tokens=8000,
+        )
+        assert orch.hypothesizer_max_tokens == 16000
+        assert orch.coder_max_tokens        == 4096
+        assert orch.critic_max_tokens       == 8000
+
 
 # ---------------------------------------------------------------------------
 # solve() — happy path

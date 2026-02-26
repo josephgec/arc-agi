@@ -95,6 +95,10 @@ Rules:
 - Each hypothesis must be a complete, standalone description.
 - Think broadly: consider rotation, reflection, recoloring, pattern extension, \
 object movement, tiling, scaling, and conditional rules.
+- OUTPUT SHAPE (REQUIRED in every hypothesis): State whether the output grid is the \
+SAME size as the input, or a DIFFERENT size. If different, give the exact formula \
+(e.g., "output is input_height × 2 rows by input_width × 2 cols", "output is 1×1", \
+"output height = number of distinct colors in input").
 
 Output ONLY the 3 numbered hypotheses, nothing else.\
 """
@@ -142,21 +146,38 @@ Do NOT think out loud. Do NOT explain. Do NOT write prose. Output ONLY the code 
 
 {dsl_docs}
 
+OUTPUT SHAPE — determine this FIRST before writing any code:
+  Same size as input  → use np.copy(grid) as your base, or use shape-preserving \
+primitives (recolor, mask, overlay, flood_fill).
+  Larger than input   → allocate output FIRST: `out = np.zeros((new_h, new_w), dtype=np.int32)` \
+then fill it. Or use scale(grid, factor) or tile(grid, n_rows, n_cols) which handle sizing.
+  Smaller than input  → use crop(grid, r1, c1, r2, c2) or crop_to_content(grid).
+
+MULTI-STEP COMPOSITION — use named intermediate variables:
+  GOOD — each step is readable and debuggable:
+    step1  = flip(grid, 0)
+    step2  = rotate(step1, 1)
+    result = recolor(step2, 1, 2)
+    return result
+
+  BAD — deeply nested calls hide shape bugs:
+    return recolor(rotate(flip(grid, 0), 1), 1, 2)
+
 CRITICAL RULE: NEVER mutate NumPy grids sequentially when swapping colors or \
 applying multiple rules (e.g., `grid[grid==1]=2` then `grid[grid==2]=1`). This \
 creates overlapping overwrite bugs. ALWAYS use `np.copy()`, `np.where()`, or \
 `np.select()` to apply transformations simultaneously.
 
-BAD — sequential mutation destroys earlier writes:
+  BAD — sequential mutation destroys earlier writes:
     grid[grid == 1] = 2
     grid[grid == 2] = 1  # BUG: also overwrites the 1→2 cells just set above
 
-GOOD — freeze source values with a copy first:
+  GOOD — freeze source values with a copy first:
     new_grid = np.copy(grid)
     new_grid[grid == 1] = 2
     new_grid[grid == 2] = 1
 
-GOOD — build result in a single vectorised step:
+  GOOD — build result in a single vectorised step:
     new_grid = np.select([grid == 1, grid == 2], [2, 1], default=grid)
 
 Output ONLY the ```python code block. No explanation. No commentary. No prose.\
@@ -247,9 +268,14 @@ Common coding errors to check:
 when swapping colors or applying multiple rules (e.g., `grid[grid==1]=2` then \
 `grid[grid==2]=1`). This creates overlapping overwrite bugs. ALWAYS use `np.copy()`, \
 `np.where()`, or `np.select()` to apply transformations simultaneously.
-- Shape errors: output array has wrong dimensions (forgot to allocate new array).
+- SHAPE ERROR: If expected.shape != predicted.shape in the diff, the code computed \
+the wrong output dimensions. Check: (a) did the hypothesis say the output is a \
+different size? (b) did the code allocate `np.zeros((new_h, new_w), ...)` with \
+the correct formula, or did it incorrectly use `np.zeros_like(grid)`? When routing \
+to CODER for a shape error, state the exact expected shape formula from the hypothesis.
 - Off-by-one errors in bounding box, crop, or loop indices.
 - Wrong color constant (0=black,1=blue,2=red,3=green,4=yellow,5=grey,6=fuschia,7=orange,8=azure,9=maroon).
+- Nested DSL calls where an intermediate result has the wrong shape fed into the next call.
 
 Analyze the failure, then end your response with EXACTLY one of these two lines:
 ROUTE: HYPOTHESIZER

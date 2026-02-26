@@ -45,6 +45,15 @@ class TestHypothesizer:
         assert "DO NOT write any code" in system_prompt
         assert "3 DISTINCT" in system_prompt
 
+    def test_system_prompt_requires_output_shape(self):
+        """Hypothesizer must be told to state whether output size matches input."""
+        client = _mock_client()
+        h = Hypothesizer(client)
+        h.generate("task grids")
+        sp = client.generate.call_args[0][0]
+        assert "OUTPUT SHAPE" in sp
+        assert "SAME size" in sp or "same size" in sp.lower()
+
     def test_task_description_in_messages(self):
         client = _mock_client()
         h = Hypothesizer(client)
@@ -151,6 +160,23 @@ class TestCoder:
         c.generate("hypothesis")
         sp = client.generate.call_args[0][0]
         assert "```python" in sp
+
+    def test_system_prompt_output_shape_section(self):
+        """Prompt must instruct Coder on same-vs-different output shape."""
+        client = _mock_client()
+        c = Coder(client)
+        c.generate("hypothesis")
+        sp = client.generate.call_args[0][0]
+        assert "OUTPUT SHAPE" in sp
+        assert "np.zeros" in sp
+
+    def test_system_prompt_multi_step_composition_section(self):
+        """Prompt must recommend named intermediate variables for multi-step transforms."""
+        client = _mock_client()
+        c = Coder(client)
+        c.generate("hypothesis")
+        sp = client.generate.call_args[0][0]
+        assert "MULTI-STEP" in sp or "named intermediate" in sp.lower() or "step1" in sp
 
 
 # ---------------------------------------------------------------------------

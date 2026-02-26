@@ -362,22 +362,26 @@ class MultiAgent:
         hypothesizer_temperature: float      = 0.6,
         coder_temperature:        float      = 0.1,
         critic_temperature:       float      = 0.2,
+        hypothesizer_max_tokens:  int        = 32768,
+        coder_max_tokens:         int        = 8192,
+        critic_max_tokens:        int        = 16384,
         timeout:                  float      = 120.0,
         debug:                    bool       = False,
         max_cycles:               int        = 9,
     ) -> None:
-        def _make_client(role_model: str | None, temperature: float) -> LLMClient:
+        def _make_client(role_model: str | None, temperature: float, max_tokens: int) -> LLMClient:
             return LLMClient(
                 backend=backend,
                 model=role_model or model,
                 temperature=temperature,
+                max_tokens=max_tokens,
                 timeout=timeout,
                 debug=debug,
             )
 
-        hyp_client = _make_client(hypothesizer_model, hypothesizer_temperature)
-        cod_client = _make_client(coder_model,        coder_temperature)
-        cri_client = _make_client(critic_model,       critic_temperature)
+        hyp_client = _make_client(hypothesizer_model, hypothesizer_temperature, hypothesizer_max_tokens)
+        cod_client = _make_client(coder_model,        coder_temperature,        coder_max_tokens)
+        cri_client = _make_client(critic_model,       critic_temperature,       critic_max_tokens)
 
         self._hypothesizer            = Hypothesizer(hyp_client)
         self._coder                   = Coder(cod_client)
@@ -391,6 +395,9 @@ class MultiAgent:
         self.hypothesizer_temperature = hypothesizer_temperature
         self.coder_temperature        = coder_temperature
         self.critic_temperature       = critic_temperature
+        self.hypothesizer_max_tokens  = hypothesizer_max_tokens
+        self.coder_max_tokens         = coder_max_tokens
+        self.critic_max_tokens        = critic_max_tokens
         self.model                    = self.hypothesizer_model  # backward-compat alias
 
     # ------------------------------------------------------------------
