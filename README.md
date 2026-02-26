@@ -39,8 +39,8 @@ Grids are 2-D arrays of integers 0–9, where each integer represents a colour:
  │  ┌────────────────┐   route+feedback  ┌────▼────────┐   │
  │  │     Critic     │ ◄─────────────────│  Sandbox    │   │
  │  │                │                   │  Evaluator  │   │
- │  │ qwen2.5-coder  │                   └─────────────┘   │
- │  │ :14b (shared)  │                                      │
+ │  │ deepseek-r1:14b│                   └─────────────┘   │
+ │  │ (reasoning)    │                                      │
  │  └────────────────┘                                      │
  └──────────────────────────────────────────────────────────┘
 ```
@@ -127,7 +127,8 @@ function solve(task):
         # ── Inner loop: Coder attempts ───────────────────────────────────
         for attempt in 1 .. max_retries + 1:
             is_last    = (attempt == max_retries + 1)
-            temperature = min((attempt - 1) × 0.3, 0.8)   # 0.0 → 0.3 → 0.6
+            temperature = min(coder_temperature + (attempt - 1) × 0.3, 0.9)
+            #   attempt 1: 0.1 (greedy)  attempt 2: 0.4  attempt 3: 0.7
 
             clean_hyp  = strip_think_tags(hypothesis)      # remove <think>…</think>
             code_text  = Coder.generate(clean_hyp, coder_feedback,
@@ -165,19 +166,21 @@ function solve(task):
 
 ### Code Extraction Cascade
 
-When the model response arrives, code is found via a four-step fallback:
+When the model response arrives, code is found via a five-step fallback. Each step always takes the **last occurrence** — reasoning models write draft code early in their thinking chain; the final answer is always at the end.
 
 ```
-  model response text
+  strip <think>…</think> blocks first
          │
-         ├─1─ ```python … ``` found?   ─yes─► extract + truncate prose
+         ├─1─ ```python … ``` found?   ─yes─► LAST match → extract + truncate prose
          │       (flexible whitespace)
-         ├─2─ ``` … ``` with def?      ─yes─► extract + truncate prose
+         ├─2─ ``` … ``` with def?      ─yes─► LAST match → extract + truncate prose
          │
-         ├─3─ bare "def transform(" ?  ─yes─► extract from def onwards
+         ├─3─ bare "def transform(" ?  ─yes─► LAST occurrence → extract from def
          │
-         ├─4─ "import numpy" + "def "? ─yes─► extract from import onwards
-         │       (reasoning-only mode)
+         ├─4─ any "def name(" ?        ─yes─► LAST occurrence → extract from def
+         │
+         ├─5─ "import numpy" + "def "? ─yes─► LAST import start → extract block
+         │       (reasoning-only mode, no fence)
          │
          └──── None → no_code_block → abandon hypothesis
 ```
@@ -214,12 +217,14 @@ A simpler self-correction loop used as a comparison baseline.
 
 Each agent role has a different cognitive requirement, so a different model type is optimal:
 
-| Role | Model | Q4_K_M RAM | Why |
-|------|-------|-----------|-----|
-| **Hypothesizer** | `deepseek-r1:32b` | ~20 GB | Distilled-Qwen reasoning model; best open-weight spatial reasoning at this size |
-| **Coder** | `qwen2.5-coder:14b` | ~9 GB | Instruction-following code gen; 14b vs 7b cuts syntax/indentation errors; never wastes tokens "thinking" |
-| **Critic** | `qwen2.5-coder:14b` | ~0 GB | Reuses the already-loaded Coder model slot — saves 9 GB vs a separate reasoning model |
-| **Total** | | **~29 GB** | Leaves ~19 GB headroom on a 48 GB machine for context windows and macOS |
+| Role | Model | Q4_K_M RAM | Temperature | Max Tokens | Why |
+|------|-------|-----------|-------------|------------|-----|
+| **Hypothesizer** | `deepseek-r1:32b` | ~20 GB | 0.6 | 32 768 | Distilled-Qwen reasoning model; best open-weight spatial reasoning at this size; needs full token budget for long thinking chains |
+| **Coder** | `qwen2.5-coder:14b` | ~9 GB | 0.1 | 8 192 | Instruction-following code gen; 14b vs 7b cuts syntax/indentation errors; near-greedy for deterministic output; code only, no reasoning overhead |
+| **Critic** | `deepseek-r1:14b` | ~9 GB | 0.2 | 16 384 | Reasoning model for nuanced failure diagnosis; 14b keeps RAM at ~38 GB total |
+| **Total** | | **~38 GB** | | | Leaves ~10 GB headroom on a 48 GB machine for context windows and macOS |
+
+> **Memory-saving alternative**: pass `--critic-model qwen2.5-coder:14b` to reuse the already-loaded Coder slot. This drops total RAM to ~29 GB at the cost of shallower failure analysis.
 
 The Coder prompt is intentionally **non-reasoning**: it opens with "Implement it immediately. Start with ` ```python `." No "think step by step." The reasoning has already been done by the Hypothesizer; the Coder's job is pure translation.
 
@@ -244,7 +249,7 @@ arc-agi/
 │   ├── multi_agent.py          # Shared helpers + cycle-based MultiAgent class
 │   ├── ensemble.py             # Run multiple Orchestrators, majority vote
 │   └── single_agent.py         # Single-agent baseline
-├── tests/                      # pytest suite (412 tests, ~92% coverage)
+├── tests/                      # pytest suite (431 tests, ~92% coverage)
 ├── data/                       # ARC dataset (400 training + 400 evaluation tasks)
 ├── run_multi_agent.py          # CLI for the multi-agent Orchestrator
 ├── run_baseline.py             # CLI for the single-agent baseline
@@ -331,7 +336,13 @@ python run_multi_agent.py \
 | `--model` | — | Fallback model for any unset role |
 | `--hypothesizer-model` | `deepseek-r1:32b` | Model for the Hypothesizer |
 | `--coder-model` | `qwen2.5-coder:14b` | Model for the Coder |
-| `--critic-model` | `qwen2.5-coder:14b` | Model for the Critic |
+| `--critic-model` | `deepseek-r1:14b` | Model for the Critic |
+| `--hypothesizer-temperature` | `0.6` | Sampling temperature for the Hypothesizer |
+| `--coder-temperature` | `0.1` | Base sampling temperature for the Coder (ramped on retries) |
+| `--critic-temperature` | `0.2` | Sampling temperature for the Critic |
+| `--hypothesizer-max-tokens` | `32768` | Token budget for the Hypothesizer |
+| `--coder-max-tokens` | `8192` | Token budget for the Coder |
+| `--critic-max-tokens` | `16384` | Token budget for the Critic |
 | `--n-hypotheses N` | `3` | Hypotheses to generate per task |
 | `--max-retries N` | `2` | Extra Coder attempts per hypothesis |
 | `--timeout SECS` | `300` | Seconds per LLM call (Ollama) |
@@ -358,7 +369,15 @@ orch = Orchestrator(
     backend="ollama",
     hypothesizer_model="deepseek-r1:32b",    # reasoning model
     coder_model="qwen2.5-coder:14b",         # coding model
-    critic_model="qwen2.5-coder:14b",        # reuse Coder slot — saves 9 GB
+    critic_model="deepseek-r1:14b",          # reasoning critic
+    # per-role temperatures
+    hypothesizer_temperature=0.6,            # creative reasoning
+    coder_temperature=0.1,                   # near-greedy, deterministic code
+    critic_temperature=0.2,                  # nuanced analysis
+    # per-role token budgets
+    hypothesizer_max_tokens=32768,           # full budget for thinking chains
+    coder_max_tokens=8192,                   # code only — no reasoning overhead
+    critic_max_tokens=16384,                 # analysis + routing + feedback
     n_hypotheses=3,
     max_retries=2,
     timeout=300,
@@ -429,7 +448,9 @@ Generated code runs in an isolated child process (`multiprocessing.Process`) tha
 
 ### LLM Client (`agents/llm_client.py`)
 
-A thin backend-agnostic wrapper. All agents call `generate(system_prompt, messages, temperature) → str`.
+A thin backend-agnostic wrapper. All agents call `generate(system_prompt, messages, temperature=None) → str`.
+
+**Per-instance defaults** — each `LLMClient` stores a `temperature` (default 0.0) and `max_tokens` (default 32768). `generate()` uses the stored temperature when none is passed explicitly, allowing each role to set its preferred default at construction time while the Orchestrator can still pass a per-call ramp-up temperature.
 
 **Ollama** — streams NDJSON from the local `/api/chat` endpoint via `urllib`.
 - Thinking tokens (`deepseek-r1`) arrive in a separate `thinking` field.
@@ -456,31 +477,60 @@ Orchestrator ────┼─ coder_model ────────► Coder LL
 
 All three share the same `backend` and `timeout`. Mixing backends per role is not currently supported.
 
+Each role also has an independent **temperature** and **max_tokens** stored on its `LLMClient`. The Coder's `generate()` call uses a temperature ramp (`coder_temperature + (attempt−1) × 0.3`, capped at 0.9) rather than the stored base — retry diversity increases while the first attempt stays near-greedy.
+
 ### Agent Roles & Prompt Design (`agents/roles.py`)
 
 #### Hypothesizer
-Proposes up to 3 distinct natural-language transformation algorithms from the training pairs. Prompt instructs: no code, numbered hypotheses, precise about colours and geometry.
+Proposes up to 3 distinct natural-language transformation algorithms from the training pairs. Prompt instructs:
+- No code — pure English algorithm descriptions
+- Numbered hypotheses, precise about colours and geometry
+- **OUTPUT SHAPE required in every hypothesis**: state whether output is the same size as input, or a different size, with an exact formula (e.g., `"output is input_height × 2 rows"`, `"output is 1×1"`)
+
+This output-shape requirement feeds directly into the Coder's allocation decision (see below).
 
 #### Coder
 Translates one clean hypothesis into a `def transform(grid)` function using DSL primitives.
 
 Prompt is **intentionally terse and imperative** — designed for non-reasoning coding models:
-- Opens with: *"Implement it immediately. Start your response with \`\`\`python."*
+- Opens with: *"Do NOT think out loud. Do NOT explain. Start your response with \`\`\`python."*
 - Closes with: *"No explanation. No commentary. No prose."*
-- Contains an explicit sequential-overwrite warning with bad/good examples:
 
+Three structural sections guide error-prone patterns:
+
+**OUTPUT SHAPE** — models must decide output allocation before writing any logic:
 ```
-BAD  — mutates grid in place (second assignment sees first's changes):
-    grid[grid == 1] = 2
-    grid[grid == 2] = 1   ← also changes the 1s just set to 2
+Same size as input  → use np.copy(grid) as base, or shape-preserving primitives
+Larger than input   → allocate first: out = np.zeros((new_h, new_w), dtype=np.int32)
+                      then fill, OR use scale(grid, factor) / tile(grid, n_rows, n_cols)
+Smaller than input  → use crop(grid, r1, c1, r2, c2) or crop_to_content(grid)
+```
 
-GOOD — freeze source with np.copy:
-    new = np.copy(grid)
-    new[grid == 1] = 2
-    new[grid == 2] = 1
+**MULTI-STEP COMPOSITION** — named intermediate variables, not deep nesting:
+```python
+# GOOD — each step readable and debuggable
+step1  = flip(grid, 0)
+step2  = rotate(step1, 1)
+result = recolor(step2, 1, 2)
+return result
 
-GOOD — single vectorised step with np.select:
-    new = np.select([grid==1, grid==2], [2, 1], default=grid)
+# BAD — nested calls hide shape bugs
+return recolor(rotate(flip(grid, 0), 1), 1, 2)
+```
+
+**CRITICAL RULE** — sequential-overwrite warning with bad/good examples:
+```python
+# BAD — second assignment also overwrites cells set by first
+grid[grid == 1] = 2
+grid[grid == 2] = 1   # ← also changes the 1s just set to 2
+
+# GOOD — freeze source with np.copy
+new = np.copy(grid)
+new[grid == 1] = 2
+new[grid == 2] = 1
+
+# GOOD — single vectorised step with np.select
+new = np.select([grid==1, grid==2], [2, 1], default=grid)
 ```
 
 Before building the user message, `Coder.generate()` strips `<think>…</think>` blocks from the hypothesis. This ensures the small coding model receives only the clean algorithm description, not the reasoning model's chain-of-thought.
@@ -489,6 +539,8 @@ Before building the user message, `Coder.generate()` strips `<think>…</think>`
 Analyzes a failed attempt (hypothesis + code + error + pixel diff showing full grids for the first failing pair) and outputs a route + actionable feedback:
 - `ROUTE: HYPOTHESIZER` — the logical rule itself is wrong
 - `ROUTE: CODER` — the hypothesis is sound but was implemented incorrectly
+
+Prompt explicitly checks common failure modes: sequential overwrite bugs, **shape errors** (predicted.shape ≠ expected.shape — the Critic is instructed to quote the correct shape formula from the hypothesis), off-by-one indices, wrong colour constants, and nested DSL calls with shape mismatches.
 
 ### Hypothesis Parsing
 
@@ -509,14 +561,14 @@ The Hypothesizer's response is parsed with a three-layer strategy tuned for reas
 
 ### Orchestrator Loop Details (`agents/orchestrator.py`)
 
-**Temperature ramp** — greedy on first attempt, increasing on retries:
+**Temperature ramp** — starts from `coder_temperature` (default 0.1), increases by 0.3 per retry, capped at 0.9:
 
-| Attempt | Temperature |
-|---------|------------|
-| 1 | 0.0 (greedy) |
-| 2 | 0.3 |
-| 3 | 0.6 |
-| 4+ | 0.8 (cap) |
+| Attempt | Temperature (coder_temperature=0.1) |
+|---------|-------------------------------------|
+| 1 | 0.1 (near-greedy) |
+| 2 | 0.4 |
+| 3 | 0.7 |
+| 4+ | 0.9 (cap) |
 
 **Stuck detection** — if a hypothesis scores 0/N correct for 2+ consecutive attempts, the Critic is skipped and the hypothesis is abandoned. A hypothesis that never gets any pair right has a logic flaw, not a code bug.
 
@@ -536,7 +588,7 @@ Runs multiple independent Orchestrator instances on the same task, collects ever
 pytest tests/
 ```
 
-412 tests covering:
+431 tests covering:
 - DSL primitives and edge cases (all-background grids, large inputs)
 - Sandbox execution (timeouts, exceptions, stdin rejection)
 - LLM client streaming (thinking tokens, partial results, timeouts)
