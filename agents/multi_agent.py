@@ -127,7 +127,12 @@ def _strip_thinking(text: str) -> str:
 
 
 def _truncate_to_valid_function(text: str) -> str:
-    """Keep lines up to and including the end of the first complete function body."""
+    """Keep lines up to the end of the first complete function body.
+
+    Stops (without including) the first non-empty, non-indented, non-'def'
+    line encountered after the function starts.  This strips reasoning prose
+    that reasoning models sometimes write after `return` inside a code fence.
+    """
     lines   = text.splitlines()
     in_func = False
     result  = []
@@ -135,23 +140,32 @@ def _truncate_to_valid_function(text: str) -> str:
         if line.startswith("def "):
             in_func = True
         if in_func:
-            result.append(line)
             stripped = line.rstrip()
+            # A non-empty, column-0 line that isn't another def is outside the
+            # function body — stop here and do NOT include this line.
             if stripped and not stripped[0].isspace() and not stripped.startswith("def "):
                 break
-    return "\n".join(result) if result else text
+            result.append(line)
+    return "\n".join(result).rstrip() if result else text
 
 
 def _extract_code(text: str) -> str | None:
-    """Extract the first ```python block from text. Falls back to bare def."""
+    """Extract the first ```python block from text. Falls back to bare def.
+
+    After extraction, trailing prose that leaked inside the code fence
+    (a common artefact of reasoning models) is removed by
+    _truncate_to_valid_function so the sandbox never sees a SyntaxError
+    caused by the model explaining its own code after the return statement.
+    """
     m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
     if m:
-        return m.group(1).strip()
+        candidate = m.group(1).strip()
+        return _truncate_to_valid_function(candidate) if "def " in candidate else candidate
     m = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
     if m:
         candidate = m.group(1).strip()
         if "def " in candidate:
-            return candidate
+            return _truncate_to_valid_function(candidate)
     m = re.search(r"(def \w+\(.*)", text)
     if m:
         return _truncate_to_valid_function(text[m.start():])
@@ -212,12 +226,29 @@ def _diff_summary(expected, predicted, max_show: int = 12) -> str:
 
 
 def _format_diff(eval_result: dict) -> str:
-    """Collect per-pair diffs into a single string."""
+    """Collect per-pair diffs into a single string.
+
+    For the first failing pair, also shows the full predicted and expected
+    grids (capped at 200 cells each) so the Critic can spot high-level
+    patterns such as "output equals input" or "output is a partial mapping".
+    """
+    _FULL_GRID_CELL_LIMIT = 200
     parts = []
+    first_fail = True
     for i, pair in enumerate(eval_result["pairs"]):
         if not pair["correct"]:
             diff = _diff_summary(pair["expected"], pair["predicted"])
-            parts.append(f"Pair {i + 1}:\n{diff}")
+            section = f"Pair {i + 1}:\n{diff}"
+            if first_fail and pair["predicted"] is not None:
+                exp = pair["expected"]
+                pred = pair["predicted"]
+                if exp.size <= _FULL_GRID_CELL_LIMIT:
+                    section += (
+                        f"\n  Full expected:  {_grid_to_str(exp)}"
+                        f"\n  Full predicted: {_grid_to_str(pred)}"
+                    )
+                first_fail = False
+            parts.append(section)
     return "\n\n".join(parts) if parts else "(all pairs correct)"
 
 

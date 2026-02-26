@@ -112,11 +112,14 @@ class TestGenerateOllama:
             result = client.generate("sys", [{"role": "user", "content": "hi"}])
         assert result == "Hello world"
 
-    def test_thinking_only_wrapped_in_tags(self):
+    def test_thinking_only_returned_raw(self):
+        # When content is empty the model put its final answer inside the
+        # thinking field (deepseek-r1:32b behaviour).  Return raw thinking
+        # without tags so parsers can still find hypotheses and code blocks.
         client = self._client()
         with patch("urllib.request.urlopen", return_value=_ollama_stream(thinking="I reasoned")):
             result = client.generate("sys", [{"role": "user", "content": "hi"}])
-        assert result == "<think>I reasoned</think>"
+        assert result == "I reasoned"
 
     def test_thinking_and_content_combined(self):
         client = self._client()

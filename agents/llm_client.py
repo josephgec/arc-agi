@@ -209,5 +209,12 @@ class LLMClient:
         if thinking and content:
             return f"<think>{thinking}</think>\n{content}"
         if thinking:
-            return f"<think>{thinking}</think>"
+            # Some model configs (e.g. deepseek-r1:32b via Ollama) place the
+            # entire output — reasoning AND final answer — inside the thinking
+            # field, leaving content empty.  Returning the raw thinking without
+            # tags lets callers (code extractors, hypothesis parsers) find
+            # numbered lists and ```python blocks within it directly.
+            # _strip_thinking won't remove anything since there are no tags,
+            # which is the desired behaviour here.
+            return thinking
         return content
