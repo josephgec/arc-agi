@@ -48,6 +48,94 @@ def _grid_to_str(grid) -> str:
     )
 
 
+def _subgrid_analysis(grid) -> str | None:
+    """Detect regular grid-line patterns and return a compact meta-grid description.
+
+    When a grid has rows/columns entirely filled with one repeated color (grid
+    lines), this function returns a summary showing:
+      - The grid-line color and spacing
+      - A "meta-grid" where each cell shows the dominant non-line color of each
+        sub-block, making the pattern immediately visible.
+
+    Returns None if no clear grid-line structure is found.
+    """
+    h, w = grid.shape
+
+    # Find candidate grid-line rows: rows where every cell has the same value
+    # and that value is non-zero (real color, not just empty rows).
+    def _uniform_indices(arr_2d, axis):
+        """Return indices of rows (axis=0) or cols (axis=1) that are uniform and non-zero."""
+        result = []
+        n = arr_2d.shape[axis]
+        for i in range(n):
+            row = arr_2d[i] if axis == 0 else arr_2d[:, i]
+            if row.min() == row.max() and row[0] != 0:
+                result.append((i, int(row[0])))
+        return result
+
+    row_lines = _uniform_indices(grid, 0)
+    col_lines = _uniform_indices(grid, 1)
+
+    if not row_lines or not col_lines:
+        return None
+
+    # Check that line color is consistent and spacing is regular.
+    row_colors  = {c for _, c in row_lines}
+    col_colors  = {c for _, c in col_lines}
+    if len(row_colors) != 1 or len(col_colors) != 1:
+        return None
+    line_color = row_colors.pop()
+    if col_colors.pop() != line_color:
+        return None
+
+    row_idxs = [i for i, _ in row_lines]
+    col_idxs = [i for i, _ in col_lines]
+
+    # Derive sub-block boundary lists (gaps between grid lines, plus edges).
+    def _boundaries(line_idxs, total):
+        edges = sorted(set(line_idxs))
+        bounds = []
+        prev = 0
+        for e in edges:
+            if e > prev:
+                bounds.append((prev, e))
+            prev = e + 1
+        if prev < total:
+            bounds.append((prev, total))
+        return bounds
+
+    row_bounds = _boundaries(row_idxs, h)
+    col_bounds = _boundaries(col_idxs, w)
+
+    # Need at least a 2×2 meta-grid to be interesting.
+    if len(row_bounds) < 2 or len(col_bounds) < 2:
+        return None
+
+    # Build meta-grid: for each sub-block, find the dominant non-line color.
+    meta = []
+    for r0, r1 in row_bounds:
+        meta_row = []
+        for c0, c1 in col_bounds:
+            block = grid[r0:r1, c0:c1]
+            non_zero = block[block != 0]
+            if len(non_zero) == 0:
+                meta_row.append(0)
+            else:
+                vals, counts = np.unique(non_zero, return_counts=True)
+                meta_row.append(int(vals[counts.argmax()]))
+        meta.append(meta_row)
+
+    meta_arr = np.array(meta)
+    line_name = _COLOR_NAMES.get(line_color, str(line_color))
+    n_rows, n_cols = len(row_bounds), len(col_bounds)
+    lines = [
+        f"  (Grid divided by {line_name}({line_color}) lines into "
+        f"{n_rows}×{n_cols} sub-blocks:)",
+        f"  Meta-grid (dominant color per sub-block): {_grid_to_str(meta_arr)}",
+    ]
+    return "\n".join(lines)
+
+
 def _block_analysis(inp, out) -> str | None:
     ih, iw = inp.shape
     oh, ow = out.shape
@@ -114,6 +202,12 @@ def _format_task_description(task: dict) -> str:
         ba = _block_analysis(inp, out)
         if ba:
             lines.append(ba)
+        sa_in = _subgrid_analysis(inp)
+        if sa_in:
+            lines.append(sa_in.replace("(Grid divided", "(Input grid divided"))
+            sa_out = _subgrid_analysis(out)
+            if sa_out:
+                lines.append(sa_out.replace("(Grid divided", "(Output grid divided"))
         lines.append("")
 
     test_inp = task["test"][0]["input"]

@@ -14,6 +14,7 @@ from agents.multi_agent import (
     _format_task_description,
     _parse_hypotheses,
     _strip_thinking,
+    _subgrid_analysis,
 )
 
 
@@ -375,6 +376,61 @@ class TestFormatDiff:
 # ---------------------------------------------------------------------------
 # _format_task_description
 # ---------------------------------------------------------------------------
+
+class TestSubgridAnalysis:
+    def _grid_with_lines(self):
+        """3×3 sub-blocks separated by azure(8) lines (7×7 total grid)."""
+        g = np.zeros((7, 7), dtype=np.int32)
+        # Draw azure grid lines at rows/cols 2 and 5
+        g[2, :] = 8
+        g[5, :] = 8
+        g[:, 2] = 8
+        g[:, 5] = 8
+        # Place a red(2) dot at sub-block (0,0) — rows 0-1, cols 0-1
+        g[0, 0] = 2
+        g[0, 1] = 2
+        g[1, 0] = 2
+        g[1, 1] = 2
+        # Place a green(3) dot at sub-block (1,1) — rows 3-4, cols 3-4
+        g[3, 3] = 3
+        g[3, 4] = 3
+        g[4, 3] = 3
+        g[4, 4] = 3
+        return g
+
+    def test_detects_grid_lines(self):
+        result = _subgrid_analysis(self._grid_with_lines())
+        assert result is not None
+        assert "azure(8)" in result
+
+    def test_reports_meta_grid(self):
+        result = _subgrid_analysis(self._grid_with_lines())
+        assert "Meta-grid" in result
+
+    def test_meta_grid_shows_correct_colors(self):
+        result = _subgrid_analysis(self._grid_with_lines())
+        # red(2) at sub-block (0,0) and green(3) at sub-block (1,1) should appear
+        assert "2" in result
+        assert "3" in result
+
+    def test_returns_none_for_grid_without_lines(self):
+        g = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=np.int32)
+        assert _subgrid_analysis(g) is None
+
+    def test_returns_none_for_grid_with_only_row_lines(self):
+        g = np.zeros((5, 5), dtype=np.int32)
+        g[2, :] = 1  # only row lines, no column lines
+        assert _subgrid_analysis(g) is None
+
+    def test_format_task_description_includes_subgrid_analysis(self):
+        g = self._grid_with_lines()
+        task = {
+            "train": [{"input": g, "output": g}],
+            "test":  [{"input": g}],
+        }
+        desc = _format_task_description(task)
+        assert "Meta-grid" in desc
+
 
 class TestFormatTaskDescription:
     def test_contains_training_header(self):
