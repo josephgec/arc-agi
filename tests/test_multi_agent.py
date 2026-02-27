@@ -8,7 +8,9 @@ import pytest
 
 from agents.multi_agent import (
     MultiAgent,
+    _bar_analysis,
     _color_count_summary,
+    _diagonal_analysis,
     _extract_code,
     _format_diff,
     _format_error_info,
@@ -469,6 +471,97 @@ class TestSubgridAnalysis:
         }
         desc = _format_task_description(task)
         assert "Meta-grid" in desc
+
+
+class TestDiagonalAnalysis:
+    def _diag_grid(self, period=3):
+        """7×7 grid with a diagonal stripe pattern of given period."""
+        g = np.zeros((7, 7), dtype=np.int32)
+        palette = [2, 8, 3][:period] + list(range(10, 10 + period - 3))
+        for r in range(7):
+            for c in range(7):
+                g[r, c] = palette[(r + c) % period]
+        return g
+
+    def test_detects_period3_pattern(self):
+        g = self._diag_grid(3)
+        result = _diagonal_analysis(g)
+        assert result is not None
+        assert "period 3" in result
+        assert "k=0" in result and "k=1" in result and "k=2" in result
+
+    def test_returns_none_for_single_color_grid(self):
+        # A single-color grid trivially matches any period — must be rejected.
+        g = np.full((5, 5), 3, dtype=np.int32)
+        assert _diagonal_analysis(g) is None
+
+    def test_returns_none_for_non_diagonal_pattern(self):
+        # Grid where the same anti-diagonal index maps to multiple colors.
+        g = np.array([[1, 2, 3], [2, 3, 1], [3, 2, 1]], dtype=np.int32)
+        # anti-diagonal k=0: (0,0)=1; k=1: (0,1)=2,(1,0)=2; k=2: (0,2)=3,(1,1)=3,(2,0)=3
+        # k=3: (1,2)=1,(2,1)=2 → mixed → not a diagonal stripe
+        assert _diagonal_analysis(g) is None
+
+    def test_returns_none_for_empty_grid(self):
+        g = np.zeros((5, 5), dtype=np.int32)
+        assert _diagonal_analysis(g) is None
+
+    def test_partial_diagonal_grid_detected(self):
+        # Partial grid (top-left triangle) still detects the pattern.
+        g = np.zeros((7, 7), dtype=np.int32)
+        g[0, 0] = 2; g[0, 1] = 8; g[0, 2] = 3
+        g[1, 0] = 8; g[1, 1] = 3
+        g[2, 0] = 3
+        result = _diagonal_analysis(g)
+        assert result is not None
+        assert "period 3" in result
+
+
+class TestBarAnalysis:
+    def _bar_grid_input(self):
+        """9×9 grid with 4 vertical grey bars of different lengths."""
+        g = np.zeros((9, 9), dtype=np.int32)
+        g[0:9, 5] = 5   # col5: length 9
+        g[1:9, 1] = 5   # col1: length 8
+        g[3:9, 3] = 5   # col3: length 6
+        g[6:9, 7] = 5   # col7: length 3
+        return g
+
+    def test_detects_uniform_bars_with_ranking(self):
+        result = _bar_analysis(self._bar_grid_input())
+        assert result is not None
+        assert "grey" in result
+        assert "col5" in result and "col1" in result
+        assert "Ranked" in result
+
+    def test_no_ranking_when_all_same_length(self):
+        g = np.zeros((5, 5), dtype=np.int32)
+        g[:, 1] = 5
+        g[:, 3] = 5   # both bars length 5
+        result = _bar_analysis(g)
+        assert result is not None
+        assert "Ranked" not in result
+
+    def test_returns_none_for_fewer_than_two_bars(self):
+        g = np.zeros((5, 5), dtype=np.int32)
+        g[1:4, 2] = 3   # only one bar
+        assert _bar_analysis(g) is None
+
+    def test_non_contiguous_cells_not_counted_as_bar(self):
+        g = np.zeros((5, 5), dtype=np.int32)
+        g[0, 1] = 3; g[2, 1] = 3; g[4, 1] = 3   # col1: non-contiguous
+        g[0, 3] = 3; g[2, 3] = 3; g[4, 3] = 3   # col3: non-contiguous
+        # Non-contiguous → no bars detected
+        assert _bar_analysis(g) is None
+
+    def test_colored_bars_reported_without_ranking(self):
+        g = np.zeros((6, 6), dtype=np.int32)
+        g[0:6, 1] = 2   # red bar, length 6
+        g[0:6, 3] = 3   # green bar, length 6
+        result = _bar_analysis(g)
+        assert result is not None
+        assert "Colored bars" in result
+        assert "Ranked" not in result
 
 
 class TestFormatTaskDescription:

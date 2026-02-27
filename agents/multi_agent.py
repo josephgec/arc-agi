@@ -235,6 +235,98 @@ def _color_count_summary(inp, out) -> str:
     return summary
 
 
+def _diagonal_analysis(grid) -> str | None:
+    """Detect if non-zero cells form diagonal stripes (anti-diagonal index mod k).
+
+    Returns a description like:
+      "Diagonal stripes (period 3, (r+c)%3): k=0→red(2), k=1→azure(8), k=2→green(3)"
+    or None if no periodic diagonal pattern is detected.
+    """
+    nonzero = [(r, c, int(grid[r, c]))
+               for r in range(grid.shape[0])
+               for c in range(grid.shape[1])
+               if grid[r, c] != 0]
+    if len(nonzero) < 3:
+        return None
+
+    for period in [3, 2, 4]:
+        color_map: dict[int, set] = {}
+        for r, c, v in nonzero:
+            k = (r + c) % period
+            color_map.setdefault(k, set()).add(v)
+        unique_colors = {list(colors)[0] for colors in color_map.values()}
+        if (len(color_map) == period
+                and all(len(colors) == 1 for colors in color_map.values())
+                and len(unique_colors) >= 2):   # meaningless if all classes same color
+            palette = [list(color_map[k])[0] for k in range(period)]
+            named   = [f"{_COLOR_NAMES.get(p, str(p))}({p})" for p in palette]
+            parts   = ", ".join(f"k={k}→{named[k]}" for k in range(period))
+            return f"  Diagonal stripes (period {period}, (r+c)%{period}): {parts}"
+    return None
+
+
+def _bar_analysis(grid) -> str | None:
+    """Detect uniform-color vertical or horizontal bars and summarise their lengths.
+
+    A 'bar' is a complete row or column whose non-zero cells all share the same
+    color.  Returns a compact description useful for ranking/recoloring tasks:
+
+      "  Uniform bars (grey): col1=8, col3=6, col5=9, col7=3
+         Ranked longest→shortest: col5>col1>col3>col7"
+
+    Returns None if fewer than 2 bars are found.
+    """
+    H, W = grid.shape
+
+    def _find_bars(axis: int):
+        """axis=0 → vertical bars (scan columns); axis=1 → horizontal bars (scan rows).
+
+        A bar must have at least 2 contiguous non-zero cells all of the same color.
+        Contiguity is required so that scattered same-color cells in a row/column
+        don't falsely register as a bar.
+        """
+        bars = []
+        count = W if axis == 0 else H
+        for i in range(count):
+            line     = grid[:, i] if axis == 0 else grid[i, :]
+            nonz_idx = np.where(line != 0)[0]
+            if len(nonz_idx) < 2:
+                continue
+            # Require contiguous run (no gaps between first and last non-zero cell)
+            if nonz_idx[-1] - nonz_idx[0] != len(nonz_idx) - 1:
+                continue
+            vals = line[nonz_idx]
+            if len(set(vals.tolist())) == 1:
+                bars.append((i, int(vals[0]), int(len(vals))))
+        return bars
+
+    col_bars = _find_bars(0)
+    row_bars = _find_bars(1)
+    bars     = col_bars if len(col_bars) >= len(row_bars) else row_bars
+    orient   = "col"    if len(col_bars) >= len(row_bars) else "row"
+
+    if len(bars) < 2:
+        return None
+
+    colors = {b[1] for b in bars}
+    if len(colors) == 1:
+        color_name = _COLOR_NAMES.get(list(colors)[0], str(list(colors)[0]))
+        bar_desc   = ", ".join(f"{orient}{b[0]}={b[2]}" for b in bars)
+        lines_out  = [f"  Uniform bars ({color_name}): {bar_desc}"]
+        # Only show ranking when bars actually differ in length
+        if len({b[2] for b in bars}) > 1:
+            ranked    = sorted(bars, key=lambda x: -x[2])
+            rank_desc = " > ".join(f"{orient}{b[0]}(len={b[2]})" for b in ranked)
+            lines_out.append(f"  Ranked longest→shortest: {rank_desc}")
+        return "\n".join(lines_out)
+    else:
+        bar_desc = ", ".join(
+            f"{orient}{b[0]}={_COLOR_NAMES.get(b[1], str(b[1]))}({b[1]})/len={b[2]}"
+            for b in bars
+        )
+        return f"  Colored bars: {bar_desc}"
+
+
 def _format_training_examples(task: dict) -> str:
     """Format training pairs as a compact reference for the Coder.
 
@@ -288,6 +380,18 @@ def _format_task_description(task: dict) -> str:
             sa_out = _subgrid_analysis(out)
             if sa_out:
                 lines.append(sa_out.replace("(Grid divided", "(Output grid divided"))
+        da_in = _diagonal_analysis(inp)
+        if da_in:
+            lines.append("  Input:  " + da_in.lstrip())
+            da_out = _diagonal_analysis(out)
+            if da_out:
+                lines.append("  Output: " + da_out.lstrip())
+        ba_in = _bar_analysis(inp)
+        if ba_in:
+            lines.append(ba_in)
+        ba_out = _bar_analysis(out)
+        if ba_out:
+            lines.append(ba_out)
         lines.append("")
 
     test_inp = task["test"][0]["input"]
