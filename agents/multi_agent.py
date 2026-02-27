@@ -76,17 +76,40 @@ def _subgrid_analysis(grid) -> str | None:
     row_lines = _uniform_indices(grid, 0)
     col_lines = _uniform_indices(grid, 1)
 
-    if not row_lines or not col_lines:
+    if not row_lines and not col_lines:
         return None
 
-    # Check that line color is consistent and spacing is regular.
-    row_colors  = {c for _, c in row_lines}
-    col_colors  = {c for _, c in col_lines}
-    if len(row_colors) != 1 or len(col_colors) != 1:
+    # Keep only line candidates whose color does NOT appear outside of
+    # ALL detected line positions (both rows and cols of that color).
+    # This filters out "accidental" uniform rows/cols that are actually
+    # content (e.g. a column of blue cells in a blue-content grid).
+    def _color_confined_to_lines(color):
+        """Return True if every cell with `color` is on a row- or col-line."""
+        line_rows = {i for i, c in row_lines if c == color}
+        line_cols = {j for j, c in col_lines if c == color}
+        positions = np.argwhere(grid == color)
+        for r, c in positions:
+            if r not in line_rows and c not in line_cols:
+                return False
+        return True
+
+    # Partition candidate lines by color and keep only colors that are
+    # completely confined to their line positions.
+    for color in {c for _, c in row_lines} | {c for _, c in col_lines}:
+        if not _color_confined_to_lines(color):
+            row_lines = [(i, c) for i, c in row_lines if c != color]
+            col_lines = [(j, c) for j, c in col_lines if c != color]
+
+    if not row_lines and not col_lines:
         return None
-    line_color = row_colors.pop()
-    if col_colors.pop() != line_color:
+
+    # Check that line color is consistent (row and column lines must share one color).
+    row_colors = {c for _, c in row_lines}
+    col_colors = {c for _, c in col_lines}
+    all_line_colors = row_colors | col_colors
+    if len(all_line_colors) != 1:
         return None
+    line_color = all_line_colors.pop()
 
     row_idxs = [i for i, _ in row_lines]
     col_idxs = [i for i, _ in col_lines]
@@ -107,8 +130,8 @@ def _subgrid_analysis(grid) -> str | None:
     row_bounds = _boundaries(row_idxs, h)
     col_bounds = _boundaries(col_idxs, w)
 
-    # Need at least a 2×2 meta-grid to be interesting.
-    if len(row_bounds) < 2 or len(col_bounds) < 2:
+    # Need at least 2 sub-sections in at least one dimension to be useful.
+    if len(row_bounds) < 2 and len(col_bounds) < 2:
         return None
 
     # Build meta-grid: for each sub-block, find the dominant non-line color.
@@ -131,8 +154,23 @@ def _subgrid_analysis(grid) -> str | None:
     lines = [
         f"  (Grid divided by {line_name}({line_color}) lines into "
         f"{n_rows}×{n_cols} sub-blocks:)",
-        f"  Meta-grid (dominant color per sub-block): {_grid_to_str(meta_arr)}",
     ]
+    # For 1×2 or 2×1 splits (single divider), show the actual sub-grid content
+    # so the Hypothesizer can see the relationship between the two halves directly.
+    if n_rows == 1 and n_cols == 2:
+        r0, r1 = row_bounds[0]
+        left  = grid[r0:r1, col_bounds[0][0]:col_bounds[0][1]]
+        right = grid[r0:r1, col_bounds[1][0]:col_bounds[1][1]]
+        lines.append(f"  Left  sub-grid: {_grid_to_str(left)}")
+        lines.append(f"  Right sub-grid: {_grid_to_str(right)}")
+    elif n_rows == 2 and n_cols == 1:
+        c0, c1 = col_bounds[0]
+        top    = grid[row_bounds[0][0]:row_bounds[0][1], c0:c1]
+        bottom = grid[row_bounds[1][0]:row_bounds[1][1], c0:c1]
+        lines.append(f"  Top    sub-grid: {_grid_to_str(top)}")
+        lines.append(f"  Bottom sub-grid: {_grid_to_str(bottom)}")
+    else:
+        lines.append(f"  Meta-grid (dominant color per sub-block): {_grid_to_str(meta_arr)}")
     return "\n".join(lines)
 
 

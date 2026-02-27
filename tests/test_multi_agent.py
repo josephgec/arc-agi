@@ -453,10 +453,13 @@ class TestSubgridAnalysis:
         g = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=np.int32)
         assert _subgrid_analysis(g) is None
 
-    def test_returns_none_for_grid_with_only_row_lines(self):
+    def test_returns_result_for_grid_with_only_row_lines(self):
         g = np.zeros((5, 5), dtype=np.int32)
-        g[2, :] = 1  # only row lines, no column lines
-        assert _subgrid_analysis(g) is None
+        g[2, :] = 1  # only row lines, no column lines → 2×1 split
+        result = _subgrid_analysis(g)
+        assert result is not None
+        assert "2×1" in result
+        assert "Top" in result and "Bottom" in result
 
     def test_format_task_description_includes_subgrid_analysis(self):
         g = self._grid_with_lines()
