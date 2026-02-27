@@ -208,13 +208,23 @@ class TestParseHypotheses:
         assert "Rotate" in result[0]
 
     def test_short_noise_fragments_filtered(self):
-        """Short one-liners (reasoning noise) are filtered out, leaving only full hypotheses."""
-        # Mix one full hypothesis with two noise fragments
+        """Very short one-liners (reasoning noise) are filtered out, leaving only full hypotheses."""
+        # Mix one full hypothesis with two ultra-short noise fragments (< 40 chars)
         noise = "1. Yes.\n2. Maybe not.\n"
         text = noise + _H3
         result = _parse_hypotheses(text)
         # Only _H3 is long enough; noise items should be dropped
-        assert all(len(h) >= 80 for h in result)
+        assert all(len(h) >= 40 for h in result)
+        assert any("quadrant" in h for h in result)
+
+    def test_brief_re_hyp_hypotheses_kept(self):
+        """Hypotheses of 40-79 chars (brief re-hyp output) must not be filtered out."""
+        h1 = "1. Scale grid 3x and keep only non-zero positions.\n"    # ~51 chars
+        h2 = "2. Recolor all cells and apply 90 degree rotation.\n"   # ~51 chars
+        h3 = "3. Tile input grid 2x2 and mask with the original.\n"   # ~51 chars
+        text = h1 + h2 + h3
+        result = _parse_hypotheses(text)
+        assert len(result) == 3
 
     def test_paragraph_level_split_preferred(self):
         """Blank-line-separated numbered paragraphs are found even when inner steps
@@ -232,6 +242,71 @@ class TestParseHypotheses:
         text = h1 + "\n\n" + h2
         result = _parse_hypotheses(text)
         assert len(result) == 2
+
+    def test_markdown_heading_format_split(self):
+        """deepseek-r1:32b sometimes uses '### Hypothesis N' headings — must split."""
+        h1 = (
+            "### Hypothesis 1\n"
+            "Recolor all blue cells to red and extend the pattern by tiling twice.\n"
+            "- Step 1: recolor\n- Step 2: tile\n- OUTPUT SHAPE: same size as input."
+        )
+        h2 = (
+            "### Hypothesis 2\n"
+            "Rotate the grid 90 degrees counter-clockwise and recolor 1→2.\n"
+            "- Step 1: rotate\n- Step 2: recolor\n- OUTPUT SHAPE: same size as input."
+        )
+        h3 = (
+            "### Hypothesis 3\n"
+            "Tile the grid twice horizontally, then recolor all 1s to 2s.\n"
+            "- Step 1: tile\n- Step 2: recolor\n- OUTPUT SHAPE: twice as wide as input."
+        )
+        text = h1 + "\n\n" + h2 + "\n\n" + h3
+        result = _parse_hypotheses(text)
+        assert len(result) == 3
+        assert any("Recolor" in h or "recolor" in h for h in result)
+
+    def test_plain_hypothesis_heading_format_split(self):
+        """'Hypothesis 1:' plain heading variant must also be recognised."""
+        h1 = (
+            "Hypothesis 1: Recolor blue to red and tile to double output size.\n"
+            "- Step 1: recolor each 1 to 2 across the whole grid.\n"
+            "- Step 2: tile(grid, 1, 2) to widen.\n"
+            "- OUTPUT SHAPE: same height, double width."
+        )
+        h2 = (
+            "Hypothesis 2: Rotate 180 degrees and recolor 1→2.\n"
+            "- Step 1: rotate(grid, 2).\n"
+            "- Step 2: recolor(result, 1, 2).\n"
+            "- OUTPUT SHAPE: same size as input."
+        )
+        text = h1 + "\n\n" + h2
+        result = _parse_hypotheses(text)
+        assert len(result) == 2
+
+    def test_tail_search_extracts_last_numbered_sequence(self):
+        """When raw thinking has numbered reasoning steps then final hypotheses,
+        Strategy 4 must find the LAST '1. ' sequence and return those 3 items."""
+        reasoning = (
+            "Let me analyse the pairs.\n\n"
+            "1. The input is 3x3 and output is 9x9.\n"
+            "2. Colors appear to shift by one.\n"
+            "3. No clear reflection pattern.\n\n"
+            "Thinking more carefully...\n\n"
+            "1. Scale-up transformation: output is 3× larger.\n"
+            "   - Step 1: allocate 9×9 grid.\n"
+            "   - Step 2: fill each 3×3 block with the source cell color.\n"
+            "   - OUTPUT SHAPE: input rows×3 by input cols×3.\n\n"
+            "2. Tile + recolor: tile the grid 3×3 then shift colors.\n"
+            "   - Step 1: tile(grid, 3, 3).\n"
+            "   - Step 2: recolor each value +1 mod 10.\n"
+            "   - OUTPUT SHAPE: input rows×3 by input cols×3.\n\n"
+            "3. Mosaic: embed copies at non-zero positions.\n"
+            "   - Step 1: for each non-zero cell place a copy of the input.\n"
+            "   - OUTPUT SHAPE: input rows×3 by input cols×3.\n"
+        )
+        result = _parse_hypotheses(reasoning)
+        assert len(result) == 3
+        assert all("OUTPUT SHAPE" in h for h in result)
 
 
 # ---------------------------------------------------------------------------

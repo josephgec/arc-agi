@@ -180,6 +180,15 @@ creates overlapping overwrite bugs. ALWAYS use `np.copy()`, `np.where()`, or \
   GOOD — build result in a single vectorised step:
     new_grid = np.select([grid == 1, grid == 2], [2, 1], default=grid)
 
+CRITICAL RULE: NEVER treat a NumPy row/column slice as a fresh array — it is a \
+VIEW of the original.
+  BAD:  row = grid[i]; row[j] = 2   # mutates grid!
+  GOOD: row = grid[i].copy(); row[j] = 2
+
+SHAPE VERIFICATION — before returning, mentally verify your output shape matches \
+the training examples.  The training context shows the exact expected (rows×cols) \
+for each pair.  If your formula gives a different shape, fix it before returning.
+
 Output ONLY the ```python code block. No explanation. No commentary. No prose.\
 """
 
@@ -277,11 +286,13 @@ to CODER for a shape error, state the exact expected shape formula from the hypo
 - Wrong color constant (0=black,1=blue,2=red,3=green,4=yellow,5=grey,6=fuschia,7=orange,8=azure,9=maroon).
 - Nested DSL calls where an intermediate result has the wrong shape fed into the next call.
 
+Be concise — keep your TOTAL response under 150 words. Do NOT repeat the input or the code.
+
 Analyze the failure, then end your response with EXACTLY one of these two lines:
 ROUTE: HYPOTHESIZER
 ROUTE: CODER
 
-Immediately after the route line, write specific, actionable feedback for the next agent.\
+Immediately after the route line, write 1–3 sentences of specific, actionable feedback for the next agent.\
 """
 
     def __init__(self, client: LLMClient) -> None:

@@ -188,7 +188,7 @@ class TestOrchestratorInit:
         orch = self._make()
         assert orch.hypothesizer_max_tokens == 32768
         assert orch.coder_max_tokens        == 8192
-        assert orch.critic_max_tokens       == 16384
+        assert orch.critic_max_tokens       == 4096
 
     def test_max_tokens_overrides_stored(self):
         orch = self._make(
@@ -561,3 +561,187 @@ class TestPredict:
 
         result = orch.predict(simple_task())
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Re-hypothesizing loop
+# ---------------------------------------------------------------------------
+
+class TestRehypothesizing:
+    def _make(self, **kwargs) -> Orchestrator:
+        with patch("agents.orchestrator.LLMClient",
+                   side_effect=_mock_client_factory("ollama", "test-model")):
+            return Orchestrator(backend="ollama", **kwargs)
+
+    def test_max_rehypothesizing_stored(self):
+        orch = self._make(max_rehypothesizing=3)
+        assert orch.max_rehypothesizing == 3
+
+    def test_max_rehypothesizing_default(self):
+        assert self._make().max_rehypothesizing == 2
+
+    def test_rehypothesizing_called_when_all_hypotheses_wrong(self):
+        """When all initial hypotheses fail with HYPOTHESIZER route, the
+        Hypothesizer is called again with the Critic's feedback."""
+        # max_retries=1 so attempt 1 is not last → Critic is called after it.
+        orch = make_orchestrator(max_retries=1)
+        orch.max_rehypothesizing = 1
+
+        # Round 0: three hypotheses, each fails on attempt 1 → Critic → HYPOTHESIZER
+        # Round 1: one hypothesis that succeeds on first attempt
+        orch._hypothesizer.generate.side_effect = [
+            _HYP3,          # round 0
+            _HYP3,          # round 1 (re-hyp)
+        ]
+        orch._coder.generate.side_effect = [
+            _wrong_code(), _wrong_code(), _wrong_code(),  # round 0: all fail attempt 1
+            _correct_code(),                               # round 1: first succeeds
+        ]
+        orch._critic.analyze.return_value = _critic_hyp("Try a different approach.")
+
+        result = orch.solve(simple_task())
+        assert result["success"] is True
+        assert orch._hypothesizer.generate.call_count == 2
+
+    def test_critic_feedback_passed_to_rehypothesizer(self):
+        """The Critic's feedback from the failing round must be forwarded to
+        the Hypothesizer on the re-hypothesizing call."""
+        orch = make_orchestrator(max_retries=1)
+        orch.max_rehypothesizing = 1
+
+        orch._hypothesizer.generate.side_effect = [_HYP3, _HYP3]
+        orch._coder.generate.side_effect = [
+            _wrong_code(), _wrong_code(), _wrong_code(),  # round 0 attempt 1s
+            _correct_code(),
+        ]
+        orch._critic.analyze.return_value = _critic_hyp("SPECIFIC_FEEDBACK")
+
+        orch.solve(simple_task())
+
+        # Second Hypothesizer call must receive the feedback as its second argument.
+        second_call = orch._hypothesizer.generate.call_args_list[1]
+        feedback_arg = second_call[0][1]   # generate(task_description, feedback)
+        assert feedback_arg == "SPECIFIC_FEEDBACK"
+
+    def test_no_rehypothesizing_when_max_is_zero(self):
+        """max_rehypothesizing=0 must not trigger any extra Hypothesizer calls."""
+        orch = make_orchestrator(max_retries=1)  # Critic is called, but no re-hyp
+        orch.max_rehypothesizing = 0
+
+        orch._hypothesizer.generate.return_value = _HYP3
+        orch._coder.generate.return_value  = _wrong_code()
+        orch._critic.analyze.return_value  = _critic_hyp()
+
+        orch.solve(simple_task())
+        assert orch._hypothesizer.generate.call_count == 1
+
+    def test_rehypothesizing_stops_on_success_without_extra_rounds(self):
+        """Once a candidate is found, no further re-hypothesizing happens."""
+        orch = make_orchestrator(max_retries=0)
+        orch.max_rehypothesizing = 2  # could do 2 extra rounds; should stop after 0
+
+        orch._hypothesizer.generate.return_value = _HYP3
+        orch._coder.generate.return_value         = _correct_code()
+
+        orch.solve(simple_task())
+        assert orch._hypothesizer.generate.call_count == 1
+
+    def test_no_rehypothesizing_when_no_critic_feedback(self):
+        """If the Critic routes to CODER (not HYPOTHESIZER) on all failures,
+        there is no hyp_feedback and re-hypothesizing must not fire."""
+        orch = make_orchestrator(max_retries=0)
+        orch.max_rehypothesizing = 2
+
+        orch._hypothesizer.generate.return_value = _HYP3
+        orch._coder.generate.return_value  = _wrong_code()
+        orch._critic.analyze.return_value  = _critic_coder()  # CODER route
+
+        orch.solve(simple_task())
+        # Only the initial Hypothesizer call; no re-hyp round triggered.
+        assert orch._hypothesizer.generate.call_count == 1
+
+
+class TestPartialProgressEscalation:
+    """When the last Coder attempt has partial progress (n_correct > 0), the
+    Critic should be called even at the last attempt so it can route to
+    the Hypothesizer and trigger re-hypothesizing.
+    """
+
+    def _two_pair_task(self):
+        """Task with 2 training pairs requiring different transformations."""
+        inp1 = _grid([1, 1], [1, 1])
+        out1 = _grid([2, 2], [2, 2])   # pair 1: recolor 1→2
+        inp2 = _grid([3, 3], [3, 3])
+        out2 = _grid([4, 4], [4, 4])   # pair 2: recolor 3→4
+        return {
+            "train": [
+                {"input": inp1, "output": out1},
+                {"input": inp2, "output": out2},
+            ],
+            "test": [{"input": inp1}],
+        }
+
+    def _partial_code(self) -> str:
+        """Passes pair 1 (recolor 1→2) but not pair 2 (3→4): n_correct=1/2."""
+        return "```python\ndef transform(grid):\n    return recolor(grid, 1, 2)\n```"
+
+    def test_critic_called_at_last_attempt_with_partial_progress(self):
+        """Critic must be called on the last attempt when n_correct > 0."""
+        orch = make_orchestrator(max_retries=0)  # single attempt = last attempt
+        orch.max_rehypothesizing = 0
+        orch._hypothesizer.generate.return_value = "1. H\n2. H\n3. H"
+        orch._coder.generate.return_value = self._partial_code()
+        orch._critic.analyze.return_value = _critic_hyp()
+
+        orch.solve(self._two_pair_task())
+        # Critic must have been called (partial progress at last attempt)
+        assert orch._critic.analyze.call_count >= 1
+
+    def test_critic_not_called_at_last_attempt_with_zero_progress(self):
+        """Critic must NOT be called on the last attempt when n_correct == 0."""
+        orch = make_orchestrator(max_retries=0)
+        orch.max_rehypothesizing = 0
+        orch._hypothesizer.generate.return_value = "1. H\n2. H\n3. H"
+        orch._coder.generate.return_value = _wrong_code()  # 0/1 correct
+        orch._critic.analyze.return_value = _critic_hyp()
+
+        orch.solve(simple_task())
+        orch._critic.analyze.assert_not_called()
+
+    def test_rehyp_triggered_via_partial_progress_last_attempt(self):
+        """When last attempt has n_correct > 0 and Critic routes HYPOTHESIZER,
+        a re-hypothesizing round should fire."""
+        orch = make_orchestrator(max_retries=0)
+        orch.max_rehypothesizing = 1
+
+        orch._hypothesizer.generate.side_effect = [
+            "1. H\n2. H\n3. H",   # round 0: all fail with partial
+            "1. H\n2. H\n3. H",   # round 1: re-hyp
+        ]
+        orch._coder.generate.side_effect = [
+            self._partial_code(), self._partial_code(), self._partial_code(),  # round 0
+            "```python\ndef transform(grid):\n    out=np.copy(grid);out[grid==1]=2;out[grid==3]=4;return out\n```",
+        ]
+        orch._critic.analyze.return_value = _critic_hyp("rule is incomplete")
+
+        result = orch.solve(self._two_pair_task())
+        assert orch._hypothesizer.generate.call_count == 2
+
+    def test_rehyp_triggered_when_coder_routed_at_last_attempt_with_partial(self):
+        """Even when Critic routes to CODER at the last attempt, hyp_feedback
+        should be set if there was partial progress, enabling re-hypothesizing."""
+        orch = make_orchestrator(max_retries=0)
+        orch.max_rehypothesizing = 1
+
+        orch._hypothesizer.generate.side_effect = [
+            "1. H\n2. H\n3. H",   # round 0
+            "1. H\n2. H\n3. H",   # round 1: re-hyp triggered by partial + coder route
+        ]
+        orch._coder.generate.side_effect = [
+            self._partial_code(), self._partial_code(), self._partial_code(),  # round 0
+            "```python\ndef transform(grid):\n    out=np.copy(grid);out[grid==1]=2;out[grid==3]=4;return out\n```",
+        ]
+        orch._critic.analyze.return_value = _critic_coder("fix the logic")
+
+        orch.solve(self._two_pair_task())
+        assert orch._hypothesizer.generate.call_count == 2

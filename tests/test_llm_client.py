@@ -289,6 +289,41 @@ class TestGenerateOllama:
 
         assert captured["options"]["num_predict"] == 8192
 
+    def test_keep_alive_minus_one_in_request(self):
+        """keep_alive=-1 must be sent so Ollama never unloads the model."""
+        client = self._client()
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            import json as _json
+            body = _json.loads(req.data.decode())
+            captured["body"] = body
+            return _ollama_stream("ok")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client.generate("sys", [{"role": "user", "content": "hi"}])
+
+        assert captured["body"]["keep_alive"] == -1
+
+    def test_socket_timeout_equals_full_timeout(self):
+        """urlopen must receive the full self._timeout — not a 60-second cap.
+
+        Regression test for the bug where _READ_TIMEOUT = min(self._timeout, 60)
+        caused deepseek-r1:32b to time out on large-prompt prefill.
+        """
+        client = LLMClient(backend="ollama", timeout=180.0)
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured["timeout"] = timeout
+            return _ollama_stream("ok")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client.generate("sys", [{"role": "user", "content": "hi"}])
+
+        # Must be the full 180 s, not min(180, 60) = 60
+        assert captured["timeout"] == pytest.approx(180.0)
+
 
 # ---------------------------------------------------------------------------
 # generate() — Anthropic backend (SDK mocked)

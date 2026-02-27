@@ -158,10 +158,11 @@ class LLMClient:
 
         full_messages = [{"role": "system", "content": system_prompt}] + messages
         payload = json.dumps({
-            "model":    self.model,
-            "messages": full_messages,
-            "stream":   True,
-            "options":  {
+            "model":      self.model,
+            "messages":   full_messages,
+            "stream":     True,
+            "keep_alive": -1,   # never unload the model between calls
+            "options":    {
                 "temperature": temperature,
                 "num_predict": self.max_tokens,
             },
@@ -177,7 +178,11 @@ class LLMClient:
         thinking_parts: list[str] = []
         content_parts:  list[str] = []
 
-        _READ_TIMEOUT = min(self._timeout, 60)
+        # Use the full user-specified timeout as the per-read socket timeout.
+        # A hard cap at 60 s was previously applied here, but deepseek-r1:32b
+        # needs >60 s of prefill on large prompts before emitting its first
+        # token, causing all such calls to silently fail.
+        _READ_TIMEOUT = self._timeout
         deadline      = time.monotonic() + self._timeout
 
         try:

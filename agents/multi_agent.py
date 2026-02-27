@@ -82,7 +82,12 @@ def _format_training_examples(task: dict) -> str:
         inp, out = pair["input"], pair["output"]
         ih, iw   = inp.shape
         oh, ow   = out.shape
-        lines.append(f"Example {i + 1}: input ({ih}×{iw}) → output ({oh}×{ow})")
+        # Show shape relationship so the Coder can spot the exact output size.
+        if (oh, ow) == (ih, iw):
+            shape_note = "same size as input"
+        else:
+            shape_note = f"output is {oh}×{ow} (differs from input {ih}×{iw})"
+        lines.append(f"Example {i + 1}: input ({ih}×{iw}) → output ({oh}×{ow})  [{shape_note}]")
         lines.append(f"  Input:  {_grid_to_str(inp)}")
         lines.append(f"  Output: {_grid_to_str(out)}")
     return "\n".join(lines)
@@ -215,39 +220,119 @@ def _extract_code(text: str) -> str | None:
 # Hypothesis parsing
 # ---------------------------------------------------------------------------
 
-_MIN_HYPOTHESIS_CHARS = 80  # filter out short noise fragments from reasoning
+_MIN_HYPOTHESIS_CHARS = 40  # filter out short noise fragments from reasoning
 
 
 def _parse_hypotheses(text: str, max_n: int | None = None) -> list[str]:
     """Split the Hypothesizer's output into individual hypothesis strings.
 
-    Strategy:
-    1. Try paragraph-level splitting — only keeps items that begin a new blank-
-       line-separated paragraph with a digit+period.  This avoids matching
-       numbered sub-steps that reasoning models embed inside prose.
-    2. Fall back to line-level splitting when paragraph splitting finds < 2 items.
-    3. Filter out short fragments (< _MIN_HYPOTHESIS_CHARS) that are noise.
-    4. Cap at max_n when provided.
+    Strategies tried in order (first to yield >= 2 items wins):
 
-    Returns the original text as a single-item list when no numbered items found.
+    1a. Consecutive numbered paragraph run — find the LAST sequence of
+        blank-line-separated paragraphs numbered 1., 2., 3., … in order.
+        Prefers the final hypothesis block over earlier analysis lists.
+    1b. Consecutive markdown/plain heading run — same but for
+        "### Hypothesis N" or "Hypothesis N:" paragraph sequences.
+    2.  Line-level numbered-list split — split wherever a line starts "N. ".
+    3.  Line-level markdown heading split.
+    4.  Tail search — last resort for long raw thinking traces: find the last
+        "\\n1. " in the text and parse a numbered list from that point.
+
+    After splitting, fragments shorter than _MIN_HYPOTHESIS_CHARS are dropped
+    as noise (inline reasoning steps often look like short numbered items).
+    Returns the original text as a single-item list when no structure found.
     """
-    text    = _strip_thinking(text)
+    text     = _strip_thinking(text)
     stripped = text.strip()
 
-    # ── Strategy 1: paragraph-level (blank-line delimited) ──────────────────
-    paragraphs  = re.split(r"\n\s*\n", stripped)
-    hyp_paras   = [p.strip() for p in paragraphs
-                   if re.match(r"^[1-9]\.\s", p.strip())]
-    if len(hyp_paras) >= 2:
-        hypotheses = hyp_paras
-    else:
-        # ── Strategy 2: line-level fallback ─────────────────────────────────
+    def _last_consecutive_run(
+        paragraphs: list[str],
+        first_pat: str,
+        next_pat_fn,
+    ) -> list[str]:
+        """Find the last run of consecutive paragraphs matching the pattern.
+
+        Iterates all paragraphs looking for one that matches ``first_pat``,
+        then extends into a run by checking consecutive paragraphs against
+        ``next_pat_fn(2)``, ``next_pat_fn(3)``, etc.  Keeps the rightmost
+        valid run found (length >= 2), so the final hypothesis block wins
+        over earlier analysis numbered lists.
+        """
+        best: list[str] = []
+        for i, para in enumerate(paragraphs):
+            if not re.match(first_pat, para.strip()):
+                continue
+            run      = [para.strip()]
+            expected = 2
+            j        = i + 1
+            while j < len(paragraphs):
+                np_ = paragraphs[j].strip()
+                if not np_:           # skip blank separator paragraphs
+                    j += 1
+                    continue
+                if re.match(next_pat_fn(expected), np_):
+                    run.append(np_)
+                    expected += 1
+                    j        += 1
+                else:
+                    break
+            if len(run) >= 2:
+                best = run            # keep the rightmost valid run
+        return best
+
+    paragraphs = re.split(r"\n\s*\n", stripped)
+
+    # ── Strategy 1a: consecutive numbered paragraph run ──────────────────
+    hypotheses = _last_consecutive_run(
+        paragraphs,
+        first_pat   = r"^1\.\s",
+        next_pat_fn = lambda n: fr"^{n}\.\s",
+    )
+
+    # ── Strategy 1b: consecutive markdown / plain heading run ────────────
+    if len(hypotheses) < 2:
+        hypotheses = _last_consecutive_run(
+            paragraphs,
+            first_pat   = (r"^(?:#{1,4}\s*[Hh]ypothes[ie]s\s*1"
+                           r"|[Hh]ypothes[ie]s\s*1[.:\s])"),
+            next_pat_fn = lambda n: (fr"^(?:#{1,4}\s*[Hh]ypothes[ie]s\s*{n}"
+                                     fr"|[Hh]ypothes[ie]s\s*{n}[.:\s])"),
+        )
+
+    # ── Strategy 2: line-level numbered-list split ────────────────────────
+    if len(hypotheses) < 2:
         parts      = re.split(r"(?m)^(?=[1-9]\.\s)", stripped)
         hypotheses = [p.strip() for p in parts if p.strip()]
-        if len(hypotheses) < 2:
-            return [stripped] if stripped else []
 
-    # Filter noise (short fragments are almost always reasoning fragments, not
+    # ── Strategy 3: line-level markdown heading split ─────────────────────
+    if len(hypotheses) < 2:
+        parts = re.split(
+            r"(?m)^(?=(?:#{1,4}\s*[Hh]ypothes[ie]s\s*[1-9]"
+            r"|[Hh]ypothes[ie]s\s*[1-9][.:\s]))",
+            stripped,
+        )
+        hypotheses = [p.strip() for p in parts if p.strip()]
+
+    # ── Strategy 4: tail search ───────────────────────────────────────────
+    # When the model returns raw thinking (content=0), the final structured
+    # hypotheses appear at the END of a long reasoning trace.  Find the last
+    # "\n1. " in the text and parse a numbered list from that point onward,
+    # skipping all earlier intermediate analysis lists.
+    if len(hypotheses) < 2:
+        last_one = -1
+        for m in re.finditer(r"\n1\.\s", stripped):
+            last_one = m.start()
+        if last_one >= 0:
+            tail      = stripped[last_one + 1:]   # skip the leading \n
+            parts     = re.split(r"(?m)^(?=[1-9]\.\s)", tail)
+            tail_hyps = [p.strip() for p in parts if p.strip()]
+            if len(tail_hyps) >= 2:
+                hypotheses = tail_hyps
+
+    if len(hypotheses) < 2:
+        return [stripped] if stripped else []
+
+    # Filter noise (short fragments are almost always reasoning steps, not
     # full algorithm descriptions).
     hypotheses = [h for h in hypotheses if len(h) >= _MIN_HYPOTHESIS_CHARS]
 

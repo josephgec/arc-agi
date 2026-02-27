@@ -124,9 +124,9 @@ def _parse_args() -> argparse.Namespace:
         help="Max tokens for Coder (default 8192 — code only, no reasoning overhead).",
     )
     p.add_argument(
-        "--critic-max-tokens", type=int, default=16384,
+        "--critic-max-tokens", type=int, default=4096,
         dest="critic_max_tokens", metavar="N",
-        help="Max tokens for Critic (default 16384 — analysis + routing feedback).",
+        help="Max tokens for Critic (default 4096 — concise analysis + routing feedback).",
     )
 
     # Orchestrator tuning
@@ -138,6 +138,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-retries", type=int, default=2, dest="max_retries", metavar="N",
         help="Additional Coder attempts per hypothesis after the first.",
+    )
+    p.add_argument(
+        "--max-rehypothesizing", type=int, default=2, dest="max_rehypothesizing", metavar="N",
+        help="Extra Hypothesizer rounds seeded with Critic feedback (default 2).",
     )
     p.add_argument(
         "--timeout", type=float, default=300.0, metavar="SECS",
@@ -213,6 +217,7 @@ def main() -> None:
         critic_max_tokens=args.critic_max_tokens,
         n_hypotheses=args.n_hypotheses,
         max_retries=args.max_retries,
+        max_rehypothesizing=args.max_rehypothesizing,
         timeout=args.timeout,
         debug=args.debug,
     )
