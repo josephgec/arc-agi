@@ -235,6 +235,103 @@ def _color_count_summary(inp, out) -> str:
     return summary
 
 
+def _row_period_analysis(inp, out) -> str | None:
+    """Detect if input rows (or columns) form a repeating period-N pattern.
+
+    When the input has a periodic row structure that the output extends, this
+    returns a compact summary like:
+      "Row period N: tile=[row0, row1] (input 6 rows = 3 reps; output 9 rows)"
+
+    Returns None if no period ≤ half the row count is found.
+    """
+    def _find_period(rows: list) -> int | None:
+        H = len(rows)
+        for period in range(1, H):
+            if all(rows[i] == rows[i % period] for i in range(H)):
+                return period
+        return None
+
+    inp_rows = inp.tolist()
+    out_rows = out.tolist()
+    H_in, W_in   = inp.shape
+    H_out, W_out = out.shape
+
+    # Check row-wise period (vertical)
+    if W_in == W_out and H_in != H_out:
+        p = _find_period(inp_rows)
+        if p and p < H_in:
+            n_in  = f"{H_in // p} full" if H_in % p == 0 else f"~{H_in / p:.1f}"
+            n_out = f"{H_out // p} full" if H_out % p == 0 else f"~{H_out / p:.1f}"
+            tile  = _grid_to_str(inp[:p, :])
+            return (f"  Row period: {p} rows "
+                    f"(input={H_in}rows≈{n_in} reps → output={H_out}rows≈{n_out} reps)\n"
+                    f"  Tile: {tile}")
+
+    # Check column-wise period (horizontal)
+    if H_in == H_out and W_in != W_out:
+        cols_in = [list(inp[:, c]) for c in range(W_in)]
+        p = _find_period(cols_in)
+        if p and p < W_in:
+            n_in  = f"{W_in // p} full" if W_in % p == 0 else f"~{W_in / p:.1f}"
+            n_out = f"{W_out // p} full" if W_out % p == 0 else f"~{W_out / p:.1f}"
+            tile  = _grid_to_str(inp[:, :p])
+            return (f"  Column period: {p} cols "
+                    f"(input={W_in}cols≈{n_in} reps → output={W_out}cols≈{n_out} reps)\n"
+                    f"  Tile: {tile}")
+
+    return None
+
+
+def _object_positions(inp, out) -> str | None:
+    """When objects move between input and output, summarise their positions.
+
+    Compares bounding boxes of each non-background color between input and
+    output.  Returns a compact description of which objects moved and in which
+    direction.  Helps with 'gravity' / 'sliding' tasks.
+
+    Returns None when no objects clearly moved or no movement is detected.
+    """
+    def _bboxes(grid):
+        """Return {color: (r_min, c_min, r_max, c_max)} for each non-zero color."""
+        result = {}
+        for v in np.unique(grid):
+            if v == 0:
+                continue
+            rows, cols = np.where(grid == int(v))
+            result[int(v)] = (int(rows.min()), int(cols.min()),
+                              int(rows.max()), int(cols.max()))
+        return result
+
+    in_bb  = _bboxes(inp)
+    out_bb = _bboxes(out)
+    common = set(in_bb) & set(out_bb)
+    if not common:
+        return None
+
+    moved = []
+    fixed = []
+    for color in sorted(common):
+        r1, c1, r2, c2 = in_bb[color]
+        r1o, c1o, r2o, c2o = out_bb[color]
+        dr = ((r1o + r2o) - (r1 + r2)) // 2
+        dc = ((c1o + c2o) - (c1 + c2)) // 2
+        name = f"{_COLOR_NAMES.get(color, str(color))}({color})"
+        if dr == 0 and dc == 0:
+            fixed.append(name)
+        else:
+            direction = []
+            if dr < 0: direction.append(f"↑{abs(dr)}")
+            if dr > 0: direction.append(f"↓{dr}")
+            if dc < 0: direction.append(f"←{abs(dc)}")
+            if dc > 0: direction.append(f"→{dc}")
+            moved.append(f"{name} moved {''.join(direction)}")
+
+    if not moved:
+        return None
+    parts = moved + ([f"fixed: {', '.join(fixed)}"] if fixed else [])
+    return "  Object movement: " + "; ".join(parts)
+
+
 def _diagonal_analysis(grid) -> str | None:
     """Detect if non-zero cells form diagonal stripes (anti-diagonal index mod k).
 
@@ -392,6 +489,12 @@ def _format_task_description(task: dict) -> str:
         ba_out = _bar_analysis(out)
         if ba_out:
             lines.append(ba_out)
+        rp = _row_period_analysis(inp, out)
+        if rp:
+            lines.append(rp)
+        op = _object_positions(inp, out)
+        if op:
+            lines.append(op)
         lines.append("")
 
     test_inp = task["test"][0]["input"]

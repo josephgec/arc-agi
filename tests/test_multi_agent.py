@@ -15,7 +15,9 @@ from agents.multi_agent import (
     _format_diff,
     _format_error_info,
     _format_task_description,
+    _object_positions,
     _parse_hypotheses,
+    _row_period_analysis,
     _strip_thinking,
     _subgrid_analysis,
 )
@@ -471,6 +473,73 @@ class TestSubgridAnalysis:
         }
         desc = _format_task_description(task)
         assert "Meta-grid" in desc
+
+
+class TestRowPeriodAnalysis:
+    def _make_task_grids(self, tile_rows, n_in, n_out):
+        """Build input (n_in repetitions) and output (n_out repetitions) of tile_rows."""
+        tile = np.array(tile_rows, dtype=np.int32)
+        p    = len(tile_rows)
+        inp  = np.tile(tile, (n_in,  1))
+        out  = np.tile(tile, (n_out, 1))
+        return inp, out
+
+    def test_detects_period2_row_pattern(self):
+        tile = [[0, 1, 0], [1, 0, 1]]
+        inp, out = self._make_task_grids(tile, 3, 5)
+        result = _row_period_analysis(inp, out)
+        assert result is not None
+        assert "period" in result.lower() and "2" in result
+
+    def test_detects_period3_row_pattern(self):
+        tile = [[0, 1, 0], [1, 1, 0], [0, 1, 0]]
+        inp, out = self._make_task_grids(tile, 2, 3)
+        result = _row_period_analysis(inp, out)
+        assert result is not None
+        assert "3" in result
+
+    def test_detects_partial_period_in_input(self):
+        # period=4 but input has only 1.5 repetitions (6 rows)
+        tile = [[0, 1, 0], [1, 1, 0], [0, 1, 0], [0, 1, 1]]
+        inp = np.tile(np.array(tile, dtype=np.int32), (1, 1))  # 4 rows
+        # extend by half a period
+        inp = np.vstack([inp, np.array(tile[:2], dtype=np.int32)])  # 6 rows
+        out = np.tile(np.array(tile, dtype=np.int32), (3, 1))[:9]  # 9 rows (2.25 reps)
+        result = _row_period_analysis(inp, out)
+        assert result is not None
+        assert "4" in result
+
+    def test_returns_none_for_same_height_grids(self):
+        inp = np.array([[1, 0], [0, 1], [1, 0]], dtype=np.int32)
+        out = np.array([[2, 0], [0, 2], [2, 0]], dtype=np.int32)
+        # same height, no size change → period analysis not applicable
+        assert _row_period_analysis(inp, out) is None
+
+
+class TestObjectPositions:
+    def test_detects_downward_movement(self):
+        inp = np.zeros((10, 5), dtype=np.int32)
+        out = np.zeros((10, 5), dtype=np.int32)
+        inp[1:3, 1:3] = 2   # red at rows 1-2
+        out[5:7, 1:3] = 2   # red moved to rows 5-6
+        result = _object_positions(inp, out)
+        assert result is not None
+        assert "↓" in result
+
+    def test_detects_fixed_object(self):
+        inp = np.zeros((10, 5), dtype=np.int32)
+        out = np.zeros((10, 5), dtype=np.int32)
+        inp[1:3, 1:3] = 2; out[5:7, 1:3] = 2   # red moves
+        inp[8:10, 3:5] = 8; out[8:10, 3:5] = 8  # azure fixed
+        result = _object_positions(inp, out)
+        assert result is not None
+        assert "fixed" in result and "azure" in result
+
+    def test_returns_none_when_nothing_moves(self):
+        inp = np.zeros((5, 5), dtype=np.int32)
+        out = np.zeros((5, 5), dtype=np.int32)
+        inp[2, 2] = 3; out[2, 2] = 3
+        assert _object_positions(inp, out) is None
 
 
 class TestDiagonalAnalysis:
