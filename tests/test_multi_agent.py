@@ -8,6 +8,7 @@ import pytest
 
 from agents.multi_agent import (
     MultiAgent,
+    _color_count_summary,
     _extract_code,
     _format_diff,
     _format_error_info,
@@ -376,6 +377,41 @@ class TestFormatDiff:
 # ---------------------------------------------------------------------------
 # _format_task_description
 # ---------------------------------------------------------------------------
+
+class TestColorCountSummary:
+    def test_shows_input_and_output_colors(self):
+        inp = np.array([[5, 5], [5, 5]], dtype=np.int32)
+        out = np.array([[1, 2], [2, 1]], dtype=np.int32)
+        result = _color_count_summary(inp, out)
+        assert "5" in result  # grey was in input
+        assert "1" in result
+        assert "2" in result
+
+    def test_flags_disappeared_color(self):
+        inp = np.array([[5, 5], [5, 5]], dtype=np.int32)
+        out = np.array([[1, 2], [2, 1]], dtype=np.int32)
+        result = _color_count_summary(inp, out)
+        assert "disappeared" in result or "5" in result
+
+    def test_flags_appeared_color(self):
+        inp = np.array([[5, 5], [5, 5]], dtype=np.int32)
+        out = np.array([[1, 2], [2, 1]], dtype=np.int32)
+        result = _color_count_summary(inp, out)
+        assert "appeared" in result or ("1" in result and "2" in result)
+
+    def test_no_change_has_no_notes(self):
+        inp = np.array([[1, 2], [2, 1]], dtype=np.int32)
+        result = _color_count_summary(inp, inp)
+        # No change → no parenthetical notes
+        assert "(" not in result
+
+    def test_format_task_includes_color_summary(self):
+        inp = np.array([[5, 5], [5, 5]], dtype=np.int32)
+        out = np.array([[1, 2], [2, 1]], dtype=np.int32)
+        task = {"train": [{"input": inp, "output": out}], "test": [{"input": inp}]}
+        desc = _format_task_description(task)
+        assert "Colors:" in desc
+
 
 class TestSubgridAnalysis:
     def _grid_with_lines(self):

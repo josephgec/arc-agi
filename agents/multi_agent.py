@@ -157,6 +157,46 @@ def _block_analysis(inp, out) -> str | None:
     return "\n".join(lines)
 
 
+def _color_count_summary(inp, out) -> str:
+    """Return a one-line color-count summary comparing input and output.
+
+    Shows counts for each non-zero color in both grids.  Changes between
+    input and output are flagged with arrows so the Hypothesizer can quickly
+    see which colors gained, lost, or transformed.
+
+    Example: "  Colors: in=[2:8, 5:26] out=[1:9, 2:8, 3:6, 4:3]  (grey split into 4 ranked groups)"
+    """
+    def _counts(grid):
+        vals, cnts = np.unique(grid, return_counts=True)
+        return {int(v): int(c) for v, c in zip(vals, cnts) if v != 0}
+
+    in_c  = _counts(inp)
+    out_c = _counts(out)
+
+    def _fmt(d):
+        return "[" + ", ".join(f"{v}:{c}" for v, c in sorted(d.items())) + "]" if d else "[]"
+
+    appeared  = sorted(set(out_c) - set(in_c))
+    vanished  = sorted(set(in_c)  - set(out_c))
+    changed   = sorted(v for v in set(in_c) & set(out_c) if in_c[v] != out_c[v])
+
+    notes = []
+    if vanished:
+        names = [f"{_COLOR_NAMES.get(v, v)}({v})" for v in vanished]
+        notes.append(f"{'+'.join(names)} disappeared")
+    if appeared:
+        names = [f"{_COLOR_NAMES.get(v, v)}({v})" for v in appeared]
+        notes.append(f"{'+'.join(names)} appeared")
+    if changed:
+        for v in changed:
+            notes.append(f"{_COLOR_NAMES.get(v, v)}({v}): {in_c[v]}→{out_c[v]} cells")
+
+    summary = f"  Colors: in={_fmt(in_c)} out={_fmt(out_c)}"
+    if notes:
+        summary += "  (" + "; ".join(notes) + ")"
+    return summary
+
+
 def _format_training_examples(task: dict) -> str:
     """Format training pairs as a compact reference for the Coder.
 
@@ -199,6 +239,8 @@ def _format_task_description(task: dict) -> str:
         lines.append(f"### Training pair {i + 1}")
         lines.append(f"Input  ({ih}×{iw}):\n{_grid_to_str(inp)}")
         lines.append(f"Output ({oh}×{ow}):\n{_grid_to_str(out)}")
+        # Color-count summary: shows which colors appear and how many cells each has.
+        lines.append(_color_count_summary(inp, out))
         ba = _block_analysis(inp, out)
         if ba:
             lines.append(ba)
