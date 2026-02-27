@@ -61,6 +61,31 @@ Numpy:
 
 Colors: 0=black 1=blue 2=red 3=green 4=yellow 5=grey 6=fuschia 7=orange 8=azure 9=maroon
 
+Common patterns:
+  Diagonal fill (period k): out[r][c] = palette[(r+c) % k]
+    palette = [c0, c1, c2]  # determined from input
+    result = np.array([[palette[(r+c)%len(palette)] for c in range(W)] for r in range(H)], dtype=np.int32)
+
+  Enclosed-region fill (cells enclosed by a barrier color → fill with new_color):
+    temp = np.copy(grid)
+    H, W = temp.shape
+    for r in range(H):
+        if temp[r, 0]     == 0: temp = flood_fill(temp, r, 0,     9)
+        if temp[r, W - 1] == 0: temp = flood_fill(temp, r, W - 1, 9)
+    for c in range(W):
+        if temp[0,     c] == 0: temp = flood_fill(temp, 0,     c, 9)
+        if temp[H - 1, c] == 0: temp = flood_fill(temp, H - 1, c, 9)
+    result = np.copy(grid)
+    result[temp == 0] = new_color  # remaining 0-cells are enclosed
+
+  Bar ranking by length (recolor uniform bars longest→1, next→2, …):
+    objs = find_objects(grid, background=0)
+    sorted_objs = sorted(objs, key=lambda o: len(o['pixels']), reverse=True)
+    result = np.zeros_like(grid)
+    for rank, obj in enumerate(sorted_objs, start=1):
+        for r, c in obj['pixels']:
+            result[r, c] = rank
+
 Rules:
   - Function MUST be named transform(grid) and return a numpy int32 array
   - No imports, no print, no input
