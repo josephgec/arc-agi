@@ -35,11 +35,13 @@ Grids are 2-D arrays of integers 0–9, where each integer represents a colour:
  │  │ deepseek-r1:32b│  clean rule    │ qwen2.5-coder:14b│ │
  │  │ (reasoning)    │ ─────────────► │ (code-focused)  │  │
  │  └────────────────┘                └────────┬────────┘  │
- │                                             │ code       │
- │  ┌────────────────┐   route+feedback  ┌────▼────────┐   │
- │  │     Critic     │ ◄─────────────────│  Sandbox    │   │
- │  │                │                   │  Evaluator  │   │
- │  │ deepseek-r1:14b│                   └─────────────┘   │
+ │         ▲                                   │ code       │
+ │  Critic feedback                  ┌────▼────────┐       │
+ │  (re-hypothesize)  ┌──────────────│  Sandbox    │       │
+ │  ┌────────────────┐│  route+fb    │  Evaluator  │       │
+ │  │     Critic     │◄─────────────└─────────────┘       │
+ │  │                │                                      │
+ │  │ deepseek-r1:14b│                                      │
  │  │ (reasoning)    │                                      │
  │  └────────────────┘                                      │
  └──────────────────────────────────────────────────────────┘
@@ -59,8 +61,8 @@ The key insight: **match model strengths to cognitive tasks**.
   INPUT: ARC task (train pairs + test input)
          │
          ▼
-  ╔══════════════════════════════╗
-  ║      HYPOTHESIZING           ║
+  ╔══════════════════════════════╗◄── Critic feedback (re-hypothesize)
+  ║      HYPOTHESIZING           ║    up to max_rehypothesizing extra rounds
   ║  Hypothesizer studies grids  ║
   ║  → proposes up to 3 rules    ║
   ║  (reasoning model)           ║
@@ -108,58 +110,75 @@ The key insight: **match model strengths to cognitive tasks**.
 
 ```
 function solve(task):
-    task_description   = format_grid_pairs(task.train)
+    task_description   = format_grid_pairs(task.train)   # includes structural analyses
     training_context   = format_training_examples(task.train)
 
-    # ── Hypothesizing ────────────────────────────────────────────────────
-    raw_response = Hypothesizer.generate(task_description)
-    hypotheses   = parse_and_filter(raw_response, max_n=3)
-    #   → paragraph-level split, 80-char noise filter, capped at 3
+    hyp_feedback = None   # Critic feedback for re-hypothesizing
 
-    candidates = []
+    # ── Re-hypothesizing loop (up to max_rehypothesizing + 1 rounds) ──────
+    for rehyp_round in 0 .. max_rehypothesizing:
+        # ── Hypothesizing ─────────────────────────────────────────────────
+        raw_response = Hypothesizer.generate(task_description, hyp_feedback)
+        hypotheses   = parse_and_filter(raw_response, max_n=3)
+        hyp_feedback = None   # consumed
 
-    # ── Outer loop: one pass per hypothesis ──────────────────────────────
-    for hypothesis in hypotheses:
-        prev_n_correct   = -1
-        no_improve_count = 0
-        coder_feedback   = None
+        candidates = []
 
-        # ── Inner loop: Coder attempts ───────────────────────────────────
-        for attempt in 1 .. max_retries + 1:
-            is_last    = (attempt == max_retries + 1)
-            temperature = min(coder_temperature + (attempt - 1) × 0.3, 0.9)
-            #   attempt 1: 0.1 (greedy)  attempt 2: 0.4  attempt 3: 0.7
+        # ── Outer loop: one pass per hypothesis ───────────────────────────
+        for hypothesis in hypotheses:
+            prev_n_correct   = -1
+            no_improve_count = 0
+            coder_feedback   = None
 
-            clean_hyp  = strip_think_tags(hypothesis)      # remove <think>…</think>
-            code_text  = Coder.generate(clean_hyp, coder_feedback,
-                                        training_context, temperature)
-            code       = extract_code(code_text)           # 4-step cascade
+            # ── Inner loop: Coder attempts ────────────────────────────────
+            for attempt in 1 .. max_retries + 1:
+                is_last     = (attempt == max_retries + 1)
+                temperature = min(coder_temperature + (attempt - 1) × 0.3, 0.9)
 
-            if code is None:
-                break    # no_code_block → abandon hypothesis
+                clean_hyp  = strip_think_tags(hypothesis)
+                code_text  = Coder.generate(clean_hyp, coder_feedback,
+                                            training_context, temperature)
+                code       = extract_code(code_text)   # 4-step cascade
 
-            result = Sandbox.evaluate(code, task.train)
+                if code is None:
+                    break    # no_code_block → abandon hypothesis
 
-            if result.all_correct:
-                candidates.append(code)
-                break    # hypothesis solved
+                result = Sandbox.evaluate(code, task.train)
 
-            # Stuck detection: 0 correct for 2+ consecutive attempts
-            if result.n_correct <= prev_n_correct:
-                no_improve_count += 1
-            else:
-                no_improve_count = 0
-            prev_n_correct = result.n_correct
+                if result.all_correct:
+                    candidates.append(code)
+                    break    # hypothesis solved
 
-            stuck = (result.n_correct == 0 and no_improve_count >= 2)
-            if is_last or stuck:
-                break    # Critic can't help here
+                # Stuck detection: 0 correct for 2+ consecutive attempts → abandon
+                if result.n_correct <= prev_n_correct:
+                    no_improve_count += 1
+                else:
+                    no_improve_count = 0
+                prev_n_correct = result.n_correct
 
-            diagnosis = Critic.analyze(hypothesis, code, result)
-            if diagnosis.route == HYPOTHESIZER:
-                break    # logic flaw → try next hypothesis
-            else:
-                coder_feedback = diagnosis.feedback   # code bug → retry
+                stuck = (result.n_correct == 0 and no_improve_count >= 2)
+                if stuck:
+                    break
+                if is_last and result.n_correct == 0:
+                    break    # no partial signal → Critic can't help
+
+                diagnosis = Critic.analyze(hypothesis, code, result)
+
+                if diagnosis.route == HYPOTHESIZER:
+                    hyp_feedback = diagnosis.feedback
+                    break    # logic flaw → try next hypothesis
+                elif is_last:
+                    # Partial progress at last attempt → escalate to re-hypothesizing
+                    if result.n_correct > 0:
+                        hyp_feedback = diagnosis.feedback
+                    break
+                else:
+                    coder_feedback = diagnosis.feedback   # code bug → retry
+
+        if candidates:
+            break   # solved → no need to re-hypothesize
+        if hyp_feedback is None:
+            break   # no Critic signal → re-hypothesizing won't help
 
     return first_candidate or best_partial_code
 ```
@@ -221,7 +240,7 @@ Each agent role has a different cognitive requirement, so a different model type
 |------|-------|-----------|-------------|------------|-----|
 | **Hypothesizer** | `deepseek-r1:32b` | ~20 GB | 0.6 | 32 768 | Distilled-Qwen reasoning model; best open-weight spatial reasoning at this size; needs full token budget for long thinking chains |
 | **Coder** | `qwen2.5-coder:14b` | ~9 GB | 0.1 | 8 192 | Instruction-following code gen; 14b vs 7b cuts syntax/indentation errors; near-greedy for deterministic output; code only, no reasoning overhead |
-| **Critic** | `deepseek-r1:14b` | ~9 GB | 0.2 | 16 384 | Reasoning model for nuanced failure diagnosis; 14b keeps RAM at ~38 GB total |
+| **Critic** | `deepseek-r1:14b` | ~9 GB | 0.2 | 4 096 | Reasoning model for nuanced failure diagnosis; 14b keeps RAM at ~38 GB total; concise responses (≤150 words) keep latency low |
 | **Total** | | **~38 GB** | | | Leaves ~10 GB headroom on a 48 GB machine for context windows and macOS |
 
 > **Memory-saving alternative**: pass `--critic-model qwen2.5-coder:14b` to reuse the already-loaded Coder slot. This drops total RAM to ~29 GB at the cost of shallower failure analysis.
@@ -249,7 +268,7 @@ arc-agi/
 │   ├── multi_agent.py          # Shared helpers + cycle-based MultiAgent class
 │   ├── ensemble.py             # Run multiple Orchestrators, majority vote
 │   └── single_agent.py         # Single-agent baseline
-├── tests/                      # pytest suite (431 tests, ~92% coverage)
+├── tests/                      # pytest suite (476 tests, ~92% coverage)
 ├── data/                       # ARC dataset (400 training + 400 evaluation tasks)
 ├── run_multi_agent.py          # CLI for the multi-agent Orchestrator
 ├── run_baseline.py             # CLI for the single-agent baseline
@@ -342,9 +361,10 @@ python run_multi_agent.py \
 | `--critic-temperature` | `0.2` | Sampling temperature for the Critic |
 | `--hypothesizer-max-tokens` | `32768` | Token budget for the Hypothesizer |
 | `--coder-max-tokens` | `8192` | Token budget for the Coder |
-| `--critic-max-tokens` | `16384` | Token budget for the Critic |
+| `--critic-max-tokens` | `4096` | Token budget for the Critic |
 | `--n-hypotheses N` | `3` | Hypotheses to generate per task |
 | `--max-retries N` | `2` | Extra Coder attempts per hypothesis |
+| `--max-rehypothesizing N` | `2` | Extra Hypothesizer rounds seeded with Critic feedback |
 | `--timeout SECS` | `300` | Seconds per LLM call (Ollama) |
 | `--debug` | off | Print per-state diagnostic output |
 | `--quiet` | off | Suppress per-task output |
@@ -377,9 +397,10 @@ orch = Orchestrator(
     # per-role token budgets
     hypothesizer_max_tokens=32768,           # full budget for thinking chains
     coder_max_tokens=8192,                   # code only — no reasoning overhead
-    critic_max_tokens=16384,                 # analysis + routing + feedback
+    critic_max_tokens=4096,                  # concise routing + feedback
     n_hypotheses=3,
     max_retries=2,
+    max_rehypothesizing=2,
     timeout=300,
     debug=True,
 )
@@ -479,6 +500,22 @@ All three share the same `backend` and `timeout`. Mixing backends per role is no
 
 Each role also has an independent **temperature** and **max_tokens** stored on its `LLMClient`. The Coder's `generate()` call uses a temperature ramp (`coder_temperature + (attempt−1) × 0.3`, capped at 0.9) rather than the stored base — retry diversity increases while the first attempt stays near-greedy.
 
+### Task Description Analysis (`agents/multi_agent.py`)
+
+Before the Hypothesizer sees training pairs, several structural analyses are computed and appended per pair. These transform raw pixel grids into compact, high-signal annotations:
+
+| Analysis | Trigger | Example output |
+|----------|---------|----------------|
+| **Color count summary** | Always | `Colors: in=[5:26] out=[1:9, 2:8, 3:6, 4:3]  (grey(5) disappeared; blue(1)+… appeared)` |
+| **Block analysis** | Output is an integer multiple of input size | `(Output divided into 3×3 blocks, each 3×3:) block(0,0): input[0][0]=2 → [[2,2,2],…]` |
+| **Subgrid analysis** | Input or output has uniform-color row/column lines | `(Grid divided by azure(8) lines into 7×7 sub-blocks:) Meta-grid: [[0,2,0,…],…]` |
+| **Diagonal stripe analysis** | Non-zero cells group consistently by `(r+c) % k` with ≥2 distinct colors | `Diagonal stripes (period 3, (r+c)%3): k=0→red(2), k=1→azure(8), k=2→green(3)` |
+| **Bar analysis** | ≥2 contiguous uniform-color bars in one axis | `Uniform bars (grey): col1=8, col3=6, col5=9, col7=3  Ranked longest→shortest: col5>col1>col3>col7` |
+| **Row/column period analysis** | Input rows (or cols) repeat with period N and output changes that dimension | `Row period: 4 rows (input=6rows≈~1.5 reps → output=9rows≈~2.2 reps)  Tile: [[0,1,0],[1,1,0],…]` |
+| **Object movement analysis** | Non-zero colors share bounding boxes between input and output but shifted | `Object movement: red(2) moved ↓6; fixed: azure(8)` |
+
+These annotations reduce the cognitive load on the Hypothesizer: it sees the puzzle structure directly rather than having to derive it from raw pixel arrays.
+
 ### Agent Roles & Prompt Design (`agents/roles.py`)
 
 #### Hypothesizer
@@ -533,6 +570,33 @@ new[grid == 2] = 1
 new = np.select([grid==1, grid==2], [2, 1], default=grid)
 ```
 
+**COMMON PATTERNS** — ready-to-adapt code snippets for recurring task types:
+```python
+# Diagonal fill (period k):
+palette = [c0, c1, c2]
+result = np.array([[palette[(r+c)%len(palette)] for c in range(W)]
+                   for r in range(H)], dtype=np.int32)
+
+# Enclosed-region fill (cells enclosed by a barrier → fill with new_color):
+temp = np.copy(grid)
+H, W = temp.shape
+for r in range(H):
+    if temp[r, 0]     == 0: temp = flood_fill(temp, r, 0,     9)
+    if temp[r, W - 1] == 0: temp = flood_fill(temp, r, W - 1, 9)
+for c in range(W):
+    if temp[0,     c] == 0: temp = flood_fill(temp, 0,     c, 9)
+    if temp[H - 1, c] == 0: temp = flood_fill(temp, H - 1, c, 9)
+result[temp == 0] = new_color
+
+# Bar ranking by length (recolor bars longest→1, next→2, …):
+objs = find_objects(grid, background=0)
+sorted_objs = sorted(objs, key=lambda o: len(o['pixels']), reverse=True)
+result = np.zeros_like(grid)
+for rank, obj in enumerate(sorted_objs, start=1):
+    for r, c in obj['pixels']:
+        result[r, c] = rank
+```
+
 Before building the user message, `Coder.generate()` strips `<think>…</think>` blocks from the hypothesis. This ensures the small coding model receives only the clean algorithm description, not the reasoning model's chain-of-thought.
 
 #### Critic
@@ -540,11 +604,11 @@ Analyzes a failed attempt (hypothesis + code + error + pixel diff showing full g
 - `ROUTE: HYPOTHESIZER` — the logical rule itself is wrong
 - `ROUTE: CODER` — the hypothesis is sound but was implemented incorrectly
 
-Prompt explicitly checks common failure modes: sequential overwrite bugs, **shape errors** (predicted.shape ≠ expected.shape — the Critic is instructed to quote the correct shape formula from the hypothesis), off-by-one indices, wrong colour constants, and nested DSL calls with shape mismatches.
+Prompt explicitly checks common failure modes: sequential overwrite bugs, **shape errors** (predicted.shape ≠ expected.shape — the Critic is instructed to quote the correct shape formula from the hypothesis), off-by-one indices, wrong colour constants, and nested DSL calls with shape mismatches. Responses are capped at 150 words to keep latency low.
 
 ### Hypothesis Parsing
 
-The Hypothesizer's response is parsed with a three-layer strategy tuned for reasoning models that embed numbered reasoning steps inside prose:
+The Hypothesizer's response is parsed with a four-layer strategy tuned for reasoning models that embed numbered reasoning steps inside prose:
 
 ```
   raw Hypothesizer response
@@ -555,7 +619,11 @@ The Hypothesizer's response is parsed with a three-layer strategy tuned for reas
           ├─2─ line-level split fallback
           │      → for models that don't use blank lines between hypotheses
           │
-          └─3─ noise filter: drop items < 80 chars (reasoning fragments)
+          ├─3─ consecutive-run detection
+          │      → finds the last numbered list 1./2./3. in the text;
+          │        handles reasoning models that emit multiple draft lists
+          │
+          └─4─ noise filter: drop items < 40 chars (reasoning fragments)
                   + cap at n_hypotheses (default 3)
 ```
 
@@ -572,7 +640,9 @@ The Hypothesizer's response is parsed with a three-layer strategy tuned for reas
 
 **Stuck detection** — if a hypothesis scores 0/N correct for 2+ consecutive attempts, the Critic is skipped and the hypothesis is abandoned. A hypothesis that never gets any pair right has a logic flaw, not a code bug.
 
-**Last-attempt guard** — the Critic is never called on the final attempt (its feedback would be discarded). This saves one LLM call per hypothesis.
+**Last-attempt / zero-correct guard** — the Critic is skipped on the final attempt when no pairs are correct (no partial signal to act on). If the last attempt has partial progress (n_correct > 0), the Critic is still called so its HYPOTHESIZER routing can seed the next re-hypothesizing round.
+
+**Re-hypothesizing** — when all hypotheses in a round are exhausted and the Critic flagged at least one as having a flawed rule, the Hypothesizer is called again (up to `max_rehypothesizing` extra rounds) with the Critic's feedback included. This allows the system to generate fundamentally different hypotheses when initial ones are wrong.
 
 **Training context** — the Coder receives the full training pairs alongside the hypothesis so it can mentally verify its implementation against concrete examples.
 
@@ -588,14 +658,15 @@ Runs multiple independent Orchestrator instances on the same task, collects ever
 pytest tests/
 ```
 
-431 tests covering:
+476 tests covering:
 - DSL primitives and edge cases (all-background grids, large inputs)
 - Sandbox execution (timeouts, exceptions, stdin rejection)
 - LLM client streaming (thinking tokens, partial results, timeouts)
 - All three agent roles (system prompt content, think-stripping, routing)
-- Orchestrator state transitions (stuck detection, last-attempt guard, retry loop)
-- Hypothesis parsing (paragraph split, noise filter, max_n cap)
+- Orchestrator state transitions (stuck detection, last-attempt guard, partial-progress escalation, re-hypothesizing)
+- Hypothesis parsing (paragraph split, noise filter, consecutive-run detection, max_n cap)
 - Code extraction (all four fallback levels)
+- Task description analyses (color counts, subgrid, diagonal stripes, bars, row period, object movement)
 - Ensemble voting and majority selection
 - Single-agent baseline (code extraction, retry loop, logging)
 
